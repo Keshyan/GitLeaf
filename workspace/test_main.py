@@ -237,3 +237,48 @@ def test_10_trip_csv_and_abrp_telemetry_export():
     ])
     assert "started_at,ended_at,distance_km" in csv_text
     assert "20.00,80.0,70.0,3.100,0.500,155,12.0" in csv_text
+
+
+def test_11_vcm_speed_gear_ambient_and_cluster_odometer():
+    """Verify live VCM gear/speed/ambient and meter odometer decoding."""
+    from protocol_core.leaf_protocol import decode_odometer_km, decode_vcm_ambient_c, decode_vcm_gear, decode_vcm_speed_kmh
+
+    sim = VirtualLeafOBDAdapter(speed_kmh=36.5, gear="D", ambient_temp_c=20.0, odometer_km=64_210)
+    asm = ISOTPAssembler()
+    sim.send_command("ATSH 797")
+    assert decode_vcm_gear(asm.assemble_raw(sim.send_command("22 11 56"), expected_rx_id=0x79A)) == "D"
+    assert decode_vcm_speed_kmh(asm.assemble_raw(sim.send_command("22 12 1A"), expected_rx_id=0x79A)) == pytest.approx(36.5)
+    assert decode_vcm_ambient_c(asm.assemble_raw(sim.send_command("22 11 5D"), expected_rx_id=0x79A)) == pytest.approx(20.0)
+
+    # Odometer is served by the meter cluster, not the VCM.
+    assert "NO DATA" in sim.send_command("22 0E 01")
+    sim.send_command("ATSH 743")
+    odo = decode_odometer_km(asm.assemble_raw(sim.send_command("22 0E 01"), expected_rx_id=0x763))
+    assert odo == 64_210
+
+    with pytest.raises(ValueError, match="Unknown VCM gear"):
+        decode_vcm_gear(bytes([0x62, 0x11, 0x56, 0x00]))
+
+
+def test_12_prompt_accumulation_preserves_96_cell_reply_and_times_out():
+    """A short read must not finish a 96-cell reply before the ELM prompt."""
+    from protocol_core import ELMResponseBuffer, OBD_COMMAND_TIMEOUT_S, elm_command_status
+
+    sim = VirtualLeafOBDAdapter()
+    sim.send_command("ATSH 79B")
+    raw = sim.send_command("21 02")
+    assert raw.endswith(">")
+    split = len(raw) // 2
+    assert ">" not in raw[:split]
+
+    buf = ELMResponseBuffer()
+    assert buf.append(raw[:split]) is None
+    done = buf.append(raw[split:])
+    assert done == raw
+    payload = ISOTPAssembler().assemble_raw(done, expected_rx_id=0x7BB)
+    assert len(payload) == 2 + 96 * 2
+
+    assert OBD_COMMAND_TIMEOUT_S == 8.0
+    assert elm_command_status("7BB 21 01", elapsed_s=8.0, timeout_s=OBD_COMMAND_TIMEOUT_S) == "timeout"
+    assert elm_command_status("OK\r\n>", elapsed_s=8.0, timeout_s=OBD_COMMAND_TIMEOUT_S) == "complete"
+    assert elm_command_status("AT", elapsed_s=1.0, timeout_s=OBD_COMMAND_TIMEOUT_S) == "pending"

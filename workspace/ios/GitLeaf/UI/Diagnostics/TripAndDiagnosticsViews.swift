@@ -54,11 +54,18 @@ struct TripEnergyView: View {
                         ForEach(vm.trips) { trip in
                             HStack {
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text(String(format: "%.1f km • %.0f Wh/km", trip.distanceKm, trip.whPerKm))
+                                    Text(trip.distanceIsEstimated
+                                         ? String(format: "%.1f km (estimated) • %.0f Wh/km", trip.distanceKm, trip.whPerKm)
+                                         : String(format: "%.1f km • %.0f Wh/km", trip.distanceKm, trip.whPerKm))
                                         .font(.subheadline.weight(.semibold))
                                     Text(String(format: "SoC %.0f%% → %.0f%% • Regen +%.2f kWh", trip.startSocPct, trip.endSocPct, trip.regenKwh))
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
+                                    if !trip.fromLiveAdapter {
+                                        Text("Demo — not saved to history")
+                                            .font(.caption2)
+                                            .foregroundStyle(.orange)
+                                    }
                                 }
                                 Spacer()
                                 Text(String(format: "%.2f kWh", trip.energyUsedKwh))

@@ -29,6 +29,10 @@ class VirtualLeafOBDAdapter:
             bytes([0xC1, 0x00, 0x00, 0x08]),  # U0100 (or U1000 via 0xD0 0x00)
         ]
     )
+    speed_kmh: float = 0.0
+    gear: str = "P"
+    ambient_temp_c: float = 14.5
+    odometer_km: int = 64_210
     active_tx_header: int = 0x79B
 
     def send_command(self, cmd: str) -> str:
@@ -72,6 +76,16 @@ class VirtualLeafOBDAdapter:
         elif self.active_tx_header == 0x745:
             if hex_cmd == "210E":
                 return self._format_response(0x765, self._build_tpms())
+        elif self.active_tx_header == 0x797:
+            if hex_cmd == "221156":
+                return self._format_response(0x79A, self._build_vcm_gear())
+            if hex_cmd == "22121A":
+                return self._format_response(0x79A, self._build_vcm_speed())
+            if hex_cmd == "22115D":
+                return self._format_response(0x79A, self._build_vcm_ambient())
+        elif self.active_tx_header == 0x743:
+            if hex_cmd == "220E01":
+                return self._format_response(0x763, self._build_odometer())
 
         return "NO DATA\r\n>"
 
@@ -146,6 +160,23 @@ class VirtualLeafOBDAdapter:
         usable_kwh = (gids * profile.wh_per_gid) / 1000.0
         buf.extend(int(round(usable_kwh * 100)).to_bytes(2, "big"))
         return bytes(buf)
+
+    def _build_vcm_gear(self) -> bytes:
+        code = {"P": 1, "R": 2, "N": 3, "D": 4, "E": 7, "B": 7}.get(self.gear.upper(), 0)
+        return bytes([0x62, 0x11, 0x56, code])
+
+    def _build_vcm_speed(self) -> bytes:
+        raw = max(0, min(0xFFFF, int(round(self.speed_kmh * 10))))
+        return bytes([0x62, 0x12, 0x1A, (raw >> 8) & 0xFF, raw & 0xFF])
+
+    def _build_vcm_ambient(self) -> bytes:
+        fahrenheit = self.ambient_temp_c * 9.0 / 5.0 + 32.0
+        temp_byte = int(round(fahrenheit + 41)) & 0xFF
+        return bytes([0x62, 0x11, 0x5D, 0x7F, temp_byte, 0x7F, 0x00])
+
+    def _build_odometer(self) -> bytes:
+        odo = int(self.odometer_km) & 0xFFFFFF
+        return bytes([0x62, 0x0E, 0x01, (odo >> 16) & 0xFF, (odo >> 8) & 0xFF, odo & 0xFF])
 
     def _build_tpms(self) -> bytes:
         buf = bytearray([0x61, 0x0E])

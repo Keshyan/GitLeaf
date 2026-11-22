@@ -114,6 +114,20 @@ public struct ISOTPAssembler: Sendable {
     }
 }
 
+/// Active Leaf queries for speed, gear, ambient temperature, and odometer.
+/// Speed, gear, and ambient are VCM `0x797` / `0x79A`.
+/// Odometer is the meter cluster `0x743` / `0x763` (`22 0E 01`); VCM does not serve it.
+public enum LeafVehicleQuery {
+    public static let vcmTxHeader = "ATSH 797"
+    public static let meterTxHeader = "ATSH 743"
+    public static let vcmRxID: UInt16 = 0x79A
+    public static let meterRxID: UInt16 = 0x763
+    public static let gear = "22 11 56"
+    public static let speed = "22 12 1A"
+    public static let ambient = "22 11 5D"
+    public static let odometer = "22 0E 01"
+}
+
 public enum LeafCANParser {
     private static let knownDTCs: [String: (String, String)] = [
         "P3173": ("LBC Battery Cell Voltage Sensor Fault", "CRITICAL"),
@@ -233,6 +247,43 @@ public enum LeafCANParser {
             rlPsi: Double(payload[4]) * 0.25,
             rrPsi: Double(payload[5]) * 0.25
         )
+    }
+
+    /// VCM `22 11 56` gear byte: 1=P, 2=R, 3=N, 4=D, 7=Eco.
+    /// Unknown codes return nil so a failed decode is never treated as Park.
+    public static func decodeVCMGear(_ payload: [UInt8]) -> String? {
+        guard payload.count >= 4, payload[0] == 0x62, payload[1] == 0x11, payload[2] == 0x56 else { return nil }
+        switch payload[3] {
+        case 1: return "P"
+        case 2: return "R"
+        case 3: return "N"
+        case 4: return "D"
+        case 7: return "E"
+        default: return nil
+        }
+    }
+
+    /// VCM `22 12 1A`: unsigned speed in 0.1 km/h.
+    public static func decodeVCMSpeedKmh(_ payload: [UInt8]) -> Double? {
+        guard payload.count >= 5, payload[0] == 0x62, payload[1] == 0x12, payload[2] == 0x1A else { return nil }
+        let raw = (Int(payload[3]) << 8) | Int(payload[4])
+        return Double(raw) / 10.0
+    }
+
+    /// VCM `22 11 5D`: the byte after the status byte is °F + 41 (Turbo3 / LeafSpy).
+    /// Returned in °C.
+    public static func decodeVCMAmbientC(_ payload: [UInt8]) -> Double? {
+        guard payload.count >= 5, payload[0] == 0x62, payload[1] == 0x11, payload[2] == 0x5D else { return nil }
+        let fahrenheit = Int(payload[4]) - 41
+        let celsius = (Double(fahrenheit) - 32.0) * 5.0 / 9.0
+        return (celsius * 10).rounded() / 10
+    }
+
+    /// Meter `22 0E 01` (TX `0x743` / RX `0x763`): 24-bit odometer in dash units.
+    /// ZE1 cluster replies are kilometres on metric cars and miles on US/UK cars.
+    public static func decodeOdometerKm(_ payload: [UInt8]) -> Int? {
+        guard payload.count >= 6, payload[0] == 0x62, payload[1] == 0x0E, payload[2] == 0x01 else { return nil }
+        return (Int(payload[3]) << 16) | (Int(payload[4]) << 8) | Int(payload[5])
     }
 
     public static func decodeUDSDTCs(_ payload: [UInt8], ecu: String = "LBC") -> [DTCEntry] {

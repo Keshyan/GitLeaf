@@ -7,6 +7,48 @@ from enum import Enum
 from typing import Callable
 
 
+# Keep aligned with Swift `OBDTiming` in ELMSessionLogic.swift.
+OBD_COMMAND_TIMEOUT_S = 8.0
+OBD_CONNECT_TIMEOUT_S = 10.0
+
+
+class ELMResponseBuffer:
+    """Accumulate ELM327 chunks until the `>` prompt.
+
+    A 96-cell ISO-TP reply is larger than one BLE notification or one short TCP
+    read. Returning before the prompt truncates the pack.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = ""
+
+    def reset(self) -> None:
+        self._buffer = ""
+
+    def append(self, chunk: str) -> str | None:
+        if not chunk:
+            return None
+        self._buffer += chunk
+        if ">" not in self._buffer:
+            return None
+        idx = self._buffer.index(">")
+        complete = self._buffer[: idx + 1]
+        self._buffer = self._buffer[idx + 1 :]
+        return complete
+
+
+def elm_command_status(buffer: str, elapsed_s: float, timeout_s: float = OBD_COMMAND_TIMEOUT_S) -> str:
+    """Return complete, timeout, or pending for one ELM command exchange.
+
+    A prompt completes the exchange even when the deadline has just elapsed.
+    """
+    if ">" in buffer:
+        return "complete"
+    if elapsed_s >= timeout_s:
+        return "timeout"
+    return "pending"
+
+
 class AdapterTransportType(str, Enum):
     BLE = "BLE"
     WIFI_TCP = "WIFI_TCP"

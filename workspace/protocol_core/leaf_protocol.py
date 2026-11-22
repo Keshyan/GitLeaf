@@ -273,6 +273,53 @@ def decode_tpms_pressures(payload: bytes) -> LeafTPMS:
     )
 
 
+# VCM `22 11 56` gear byte. 7 is Eco. Unknown codes are rejected so a bad
+# frame is never reported as Park.
+VCM_GEAR_BY_CODE: dict[int, str] = {1: "P", 2: "R", 3: "N", 4: "D", 7: "E"}
+
+
+def decode_vcm_gear(payload: bytes) -> str:
+    """Decode VCM gear (`22 11 56` -> `62 11 56 GG`) from RX 0x79A."""
+    if len(payload) < 4 or payload[0] != 0x62 or payload[1] != 0x11 or payload[2] != 0x56:
+        raise ValueError("Invalid VCM gear payload (expected 62 11 56)")
+    code = payload[3]
+    try:
+        return VCM_GEAR_BY_CODE[code]
+    except KeyError as exc:
+        raise ValueError(f"Unknown VCM gear code {code}") from exc
+
+
+def decode_vcm_speed_kmh(payload: bytes) -> float:
+    """Decode VCM speed (`22 12 1A` -> `62 12 1A HH LL`) in 0.1 km/h units."""
+    if len(payload) < 5 or payload[0] != 0x62 or payload[1] != 0x12 or payload[2] != 0x1A:
+        raise ValueError("Invalid VCM speed payload (expected 62 12 1A)")
+    raw = (payload[3] << 8) | payload[4]
+    return round(raw / 10.0, 1)
+
+
+def decode_vcm_ambient_c(payload: bytes) -> float:
+    """Decode VCM ambient (`22 11 5D`).
+
+    The byte after the status byte is degrees Fahrenheit plus 41, matching the
+    LeafSpy / Turbo3 reading. The result is Celsius.
+    """
+    if len(payload) < 5 or payload[0] != 0x62 or payload[1] != 0x11 or payload[2] != 0x5D:
+        raise ValueError("Invalid VCM ambient payload (expected 62 11 5D)")
+    fahrenheit = payload[4] - 41
+    celsius = (fahrenheit - 32.0) * 5.0 / 9.0
+    return round(celsius, 1)
+
+
+def decode_odometer_km(payload: bytes) -> int:
+    """Decode meter odometer (`22 0E 01` on TX 0x743 / RX 0x763) as a 24-bit value.
+
+    The cluster reports the dash unit: kilometres on metric cars, miles on US/UK cars.
+    """
+    if len(payload) < 6 or payload[0] != 0x62 or payload[1] != 0x0E or payload[2] != 0x01:
+        raise ValueError("Invalid odometer payload (expected 62 0E 01)")
+    return (payload[3] << 16) | (payload[4] << 8) | payload[5]
+
+
 def decode_uds_dtcs(payload: bytes, ecu: str = "LBC") -> list[DTCEntry]:
     """Decode UDS Service 0x19 02 FF response (`59 02 <availMask> [DTC_HI DTC_LO DTC_FTB STATUS]...`)."""
     if len(payload) < 3 or payload[0] != 0x59 or payload[1] != 0x02:

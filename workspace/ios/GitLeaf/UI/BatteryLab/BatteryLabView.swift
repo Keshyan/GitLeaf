@@ -69,31 +69,47 @@ struct BatteryLabView: View {
                             .controlSize(.mini)
                         }
 
-                        Chart(vm.sohHistory) { snap in
-                            LineMark(
-                                x: .value("Date", snap.date),
-                                y: .value("SOH %", snap.sohPct)
-                            )
-                            .foregroundStyle(.mint)
-                            .symbol(.circle)
+                        if vm.sohHistory.isEmpty {
+                            VStack(spacing: 8) {
+                                Image(systemName: "chart.xyaxis.line")
+                                    .font(.title2)
+                                    .foregroundStyle(.secondary)
+                                Text("No SOH history yet")
+                                    .font(.subheadline.weight(.semibold))
+                                Text("Connect a live adapter and tap Log Snapshot. Demo readings are not saved.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .multilineTextAlignment(.center)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 150)
+                        } else {
+                            Chart(vm.sohHistory) { snap in
+                                LineMark(
+                                    x: .value("Date", snap.date),
+                                    y: .value("SOH %", snap.sohPct)
+                                )
+                                .foregroundStyle(.mint)
+                                .symbol(.circle)
 
-                            LineMark(
-                                x: .value("Date", snap.date),
-                                y: .value("Hx %", snap.hxPct)
-                            )
-                            .foregroundStyle(.cyan)
-                            .lineStyle(StrokeStyle(lineWidth: 2, dash: [4, 3]))
-                        }
-                        .chartYScale(domain: 60...100)
-                        .frame(height: 150)
+                                LineMark(
+                                    x: .value("Date", snap.date),
+                                    y: .value("Hx %", snap.hxPct)
+                                )
+                                .foregroundStyle(.cyan)
+                                .lineStyle(StrokeStyle(lineWidth: 2, dash: [4, 3]))
+                            }
+                            .chartYScale(domain: 60...100)
+                            .frame(height: 150)
 
-                        HStack(spacing: 14) {
-                            Label("SOH %", systemImage: "line.diagonal").foregroundStyle(.mint)
-                            Label("Hx %", systemImage: "line.diagonal").foregroundStyle(.cyan)
-                            Spacer()
-                            Text("\(vm.sohHistory.count) logs").foregroundStyle(.secondary)
+                            HStack(spacing: 14) {
+                                Label("SOH %", systemImage: "line.diagonal").foregroundStyle(.mint)
+                                Label("Hx %", systemImage: "line.diagonal").foregroundStyle(.cyan)
+                                Spacer()
+                                Text("\(vm.sohHistory.count) logs").foregroundStyle(.secondary)
+                            }
+                            .font(.caption2)
                         }
-                        .font(.caption2)
                     }
                     .padding(14)
                     .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))

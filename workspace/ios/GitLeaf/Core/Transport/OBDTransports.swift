@@ -18,11 +18,13 @@ public protocol OBDTransport: AnyObject {
     func sendCommand(_ command: String) async throws -> String
 }
 
-public enum OBDTransportError: Error, LocalizedError {
+public enum OBDTransportError: Error, LocalizedError, Sendable {
     case bluetoothUnavailable
     case adapterNotFound
     case notConnected
     case timeout
+    case invalidEndpoint
+    case connectionFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -30,6 +32,69 @@ public enum OBDTransportError: Error, LocalizedError {
         case .adapterNotFound: return "No compatible OBD2 adapter found nearby."
         case .notConnected: return "OBD2 adapter is not connected."
         case .timeout: return "OBD2 adapter response timed out."
+        case .invalidEndpoint: return "Wi-Fi OBD2 port is invalid."
+        case .connectionFailed(let message): return message
+        }
+    }
+}
+
+/// Resumes a continuation at most once. Transport callbacks and timeouts race.
+private final class ResumeOnce<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Error>?
+    private var finished = false
+    var onResume: (@Sendable () -> Void)?
+
+    init(_ continuation: CheckedContinuation<T, Error>) {
+        self.continuation = continuation
+    }
+
+    @discardableResult
+    func resume(returning value: T) -> Bool {
+        finish { $0.resume(returning: value) }
+    }
+
+    @discardableResult
+    func resume(throwing error: Error) -> Bool {
+        finish { $0.resume(throwing: error) }
+    }
+
+    private func finish(_ body: (CheckedContinuation<T, Error>) -> Void) -> Bool {
+        lock.lock()
+        guard !finished, let continuation else {
+            lock.unlock()
+            return false
+        }
+        finished = true
+        self.continuation = nil
+        let callback = onResume
+        onResume = nil
+        lock.unlock()
+        body(continuation)
+        callback?()
+        return true
+    }
+}
+
+private func withTimeout<T: Sendable>(
+    seconds: TimeInterval,
+    timeoutError: OBDTransportError = .timeout,
+    _ start: @escaping (@escaping (Result<T, Error>) -> Void) -> Void
+) async throws -> T {
+    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<T, Error>) in
+        let gate = ResumeOnce(cont)
+        let sleeper = Task {
+            try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+            gate.resume(throwing: timeoutError)
+        }
+        gate.onResume = { sleeper.cancel() }
+        start { result in
+            switch result {
+            case .success(let value):
+                gate.resume(returning: value)
+            case .failure(let error):
+                gate.resume(throwing: error)
+            }
         }
     }
 }
@@ -133,14 +198,28 @@ public final class BLEOBDTransport: NSObject, OBDTransport, CBCentralManagerDele
     private var peripheral: CBPeripheral?
     private var txChar: CBCharacteristic?
     private var rxChar: CBCharacteristic?
-    private var connectContinuation: CheckedContinuation<Void, Error>?
-    private var responseContinuation: CheckedContinuation<String, Error>?
-    private var rxBuffer = ""
+    private var connectFinish: ((Result<Void, Error>) -> Void)?
+    private var responseFinish: ((Result<String, Error>) -> Void)?
+    private var commandExchange = ELMCommandExchange(startedAt: .distantPast)
+    private var acceptingResponse = false
+    private var connectOpen = false
+    private let ioLock = NSLock()
+    private let bleQueue = DispatchQueue(label: "gitleaf.ble")
 
     public func connect() async throws {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            self.connectContinuation = cont
-            self.central = CBCentralManager(delegate: self, queue: .global(qos: .userInitiated))
+        connectOpen = true
+        do {
+            try await withTimeout(seconds: OBDTiming.scanTimeoutSeconds, timeoutError: .adapterNotFound) { finish in
+                self.connectFinish = finish
+                self.central = CBCentralManager(delegate: self, queue: self.bleQueue)
+            }
+            connectOpen = false
+        } catch {
+            connectOpen = false
+            connectFinish = nil
+            central?.stopScan()
+            disconnect()
+            throw error
         }
     }
 
@@ -157,24 +236,42 @@ public final class BLEOBDTransport: NSObject, OBDTransport, CBCentralManagerDele
             throw OBDTransportError.notConnected
         }
         let payload = Data((command + "\r").utf8)
-        rxBuffer = ""
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
-            self.responseContinuation = cont
-            let writeType: CBCharacteristicWriteType = tx.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
-            p.writeValue(payload, for: tx, type: writeType)
+        do {
+            return try await withTimeout(seconds: OBDTiming.commandTimeoutSeconds) { finish in
+                self.ioLock.lock()
+                self.commandExchange = ELMCommandExchange(startedAt: Date())
+                self.acceptingResponse = true
+                self.responseFinish = { result in
+                    self.ioLock.lock()
+                    self.acceptingResponse = false
+                    self.responseFinish = nil
+                    self.ioLock.unlock()
+                    finish(result)
+                }
+                self.ioLock.unlock()
+                let writeType: CBCharacteristicWriteType = tx.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+                p.writeValue(payload, for: tx, type: writeType)
+            }
+        } catch {
+            ioLock.lock()
+            acceptingResponse = false
+            responseFinish = nil
+            ioLock.unlock()
+            throw error
         }
     }
 
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        guard connectOpen else { return }
         if central.state == .poweredOn {
             central.scanForPeripherals(withServices: Self.knownServiceUUIDs, options: nil)
         } else if central.state == .poweredOff || central.state == .unauthorized || central.state == .unsupported {
-            connectContinuation?.resume(throwing: OBDTransportError.bluetoothUnavailable)
-            connectContinuation = nil
+            finishConnect(.failure(OBDTransportError.bluetoothUnavailable))
         }
     }
 
     public func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        guard connectOpen else { return }
         let advUUIDs = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?.map { $0.uuidString } ?? []
         guard AdapterCatalog.matchBLE(name: peripheral.name, serviceUUIDs: advUUIDs) != nil else { return }
         central.stopScan()
@@ -185,6 +282,7 @@ public final class BLEOBDTransport: NSObject, OBDTransport, CBCentralManagerDele
     }
 
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        guard connectOpen else { return }
         peripheral.discoverServices(Self.knownServiceUUIDs)
     }
 
@@ -206,22 +304,49 @@ public final class BLEOBDTransport: NSObject, OBDTransport, CBCentralManagerDele
                 txChar = char
             }
         }
-        if txChar != nil && rxChar != nil && !isConnected {
+        if connectOpen && txChar != nil && rxChar != nil && !isConnected {
             isConnected = true
-            connectContinuation?.resume()
-            connectContinuation = nil
+            finishConnect(.success(()))
         }
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard error == nil, let data = characteristic.value, let chunk = String(data: data, encoding: .utf8) else { return }
-        rxBuffer += chunk
-        if rxBuffer.contains(">") {
-            let complete = rxBuffer
-            rxBuffer = ""
-            responseContinuation?.resume(returning: complete)
-            responseContinuation = nil
+        if let error {
+            deliverResponse(.failure(error))
+            return
         }
+        guard let data = characteristic.value else { return }
+        let chunk = String(decoding: data, as: UTF8.self)
+        ioLock.lock()
+        guard acceptingResponse else {
+            ioLock.unlock()
+            return
+        }
+        let exchanged = commandExchange.ingest(chunk, now: Date())
+        ioLock.unlock()
+        switch exchanged {
+        case .pending:
+            break
+        case .complete(let text):
+            deliverResponse(.success(text))
+        case .timedOut:
+            deliverResponse(.failure(OBDTransportError.timeout))
+        }
+    }
+
+    private func finishConnect(_ result: Result<Void, Error>) {
+        let finish = connectFinish
+        connectFinish = nil
+        finish?(result)
+    }
+
+    private func deliverResponse(_ result: Result<String, Error>) {
+        ioLock.lock()
+        let finish = responseFinish
+        acceptingResponse = false
+        responseFinish = nil
+        ioLock.unlock()
+        finish?(result)
     }
 }
 #endif
@@ -242,11 +367,38 @@ public final class WiFiOBDTransport: OBDTransport {
     }
 
     public func connect() async throws {
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            throw OBDTransportError.invalidEndpoint
+        }
         let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
         self.connection = conn
-        conn.start(queue: .global(qos: .userInitiated))
-        isConnected = true
+        do {
+            try await withTimeout(
+                seconds: OBDTiming.connectTimeoutSeconds,
+                timeoutError: .connectionFailed("Timed out waiting for the Wi-Fi adapter to become ready.")
+            ) { finish in
+                conn.stateUpdateHandler = { state in
+                    let decision = OBDConnectionWatch.decide(OBDConnectionWatch.phase(for: Self.event(for: state)))
+                    switch decision {
+                    case .keepWaiting:
+                        return
+                    case .connected:
+                        finish(.success(()))
+                    case .failed(let message):
+                        finish(.failure(OBDTransportError.connectionFailed(message)))
+                    }
+                }
+                conn.start(queue: .global(qos: .userInitiated))
+            }
+            conn.stateUpdateHandler = nil
+            isConnected = true
+        } catch {
+            conn.stateUpdateHandler = nil
+            conn.cancel()
+            connection = nil
+            isConnected = false
+            throw error
+        }
     }
 
     public func disconnect() {
@@ -256,60 +408,222 @@ public final class WiFiOBDTransport: OBDTransport {
     }
 
     public func sendCommand(_ command: String) async throws -> String {
-        guard let conn = connection, isConnected else { return "NO DATA\r\n>" }
-        let data = Data((command + "\r").utf8)
-        return try await withCheckedThrowingContinuation { cont in
-            conn.send(content: data, completion: .contentProcessed { err in
-                if let err { cont.resume(throwing: err); return }
-                conn.receive(minimumIncompleteLength: 1, maximumLength: 2048) { rx, _, _, rxErr in
-                    if let rxErr { cont.resume(throwing: rxErr); return }
-                    cont.resume(returning: String(data: rx ?? Data(), encoding: .utf8) ?? "")
+        guard let conn = connection, isConnected else {
+            throw OBDTransportError.notConnected
+        }
+        let started = Date()
+        let payload = Data((command + "\r").utf8)
+        let budget = OBDTiming.commandTimeoutSeconds
+        try await transmit(conn, payload, timeoutSeconds: budget)
+        var exchange = ELMCommandExchange(timeoutSeconds: budget, startedAt: started)
+        while true {
+            let remaining = budget - Date().timeIntervalSince(started)
+            if remaining <= 0 {
+                throw OBDTransportError.timeout
+            }
+            let chunk = try await receiveChunk(conn, timeoutSeconds: remaining)
+            switch exchange.ingest(chunk, now: Date()) {
+            case .complete(let text):
+                return text
+            case .timedOut:
+                throw OBDTransportError.timeout
+            case .pending:
+                continue
+            }
+        }
+    }
+
+    private func transmit(_ conn: NWConnection, _ data: Data, timeoutSeconds: TimeInterval) async throws {
+        try await withTimeout(seconds: timeoutSeconds) { finish in
+            conn.send(content: data, completion: .contentProcessed { error in
+                if let error {
+                    finish(.failure(error))
+                } else {
+                    finish(.success(()))
                 }
             })
+        }
+    }
+
+    private func receiveChunk(_ conn: NWConnection, timeoutSeconds: TimeInterval) async throws -> String {
+        try await withTimeout(seconds: timeoutSeconds) { finish in
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { data, _, isComplete, error in
+                if let error {
+                    finish(.failure(error))
+                    return
+                }
+                let text = String(decoding: data ?? Data(), as: UTF8.self)
+                if text.isEmpty && isComplete {
+                    finish(.failure(OBDTransportError.notConnected))
+                    return
+                }
+                finish(.success(text))
+            }
+        }
+    }
+
+    private static func event(for state: NWConnection.State) -> OBDConnectionEvent {
+        switch state {
+        case .setup:
+            return .setup
+        case .waiting(let error):
+            return .waiting(error.localizedDescription)
+        case .preparing:
+            return .preparing
+        case .ready:
+            return .ready
+        case .failed(let error):
+            return .failed(error.localizedDescription)
+        case .cancelled:
+            return .cancelled
+        @unknown default:
+            return .setup
         }
     }
 }
 #endif
 
 #if canImport(ExternalAccessory) && os(iOS)
+/// Serial thread that owns the ExternalAccessory streams and their run loop.
+private final class MFiIOThread: Thread {
+    private let lock = NSLock()
+    private var jobs: [() -> Void] = []
+
+    func enqueue(_ job: @escaping () -> Void) {
+        lock.lock()
+        jobs.append(job)
+        lock.unlock()
+    }
+
+    override func main() {
+        RunLoop.current.add(Port(), forMode: .default)
+        while !isCancelled {
+            lock.lock()
+            let batch = jobs
+            jobs.removeAll()
+            lock.unlock()
+            for job in batch {
+                job()
+            }
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+    }
+}
+
 /// Apple MFi Classic Bluetooth Transport for OBDLink MX+ / LX (`com.obdlink.protocol`).
 public final class MFiOBDTransport: OBDTransport {
     public let name = "OBDLink MX+ (MFi)"
     public private(set) var isConnected = false
     private var session: EASession?
     private let protocolString = "com.obdlink.protocol"
+    private let ioThread = MFiIOThread()
 
-    public init() {}
-
-    public func connect() async throws {
-        let accessories = EAAccessoryManager.shared().connectedAccessories
-        guard let acc = accessories.first(where: { $0.protocolStrings.contains(protocolString) }),
-              let eaSession = EASession(accessory: acc, forProtocol: protocolString) else {
-            throw OBDTransportError.adapterNotFound
-        }
-        eaSession.inputStream?.open()
-        eaSession.outputStream?.open()
-        self.session = eaSession
-        self.isConnected = true
+    public init() {
+        ioThread.start()
     }
 
-    public func disconnect() {
+    deinit {
         session?.inputStream?.close()
         session?.outputStream?.close()
         session = nil
+        ioThread.cancel()
+    }
+
+    public func connect() async throws {
+        let accessories = EAAccessoryManager.shared().connectedAccessories
+        guard let acc = accessories.first(where: { $0.protocolStrings.contains(protocolString) }) else {
+            throw OBDTransportError.adapterNotFound
+        }
+        try await withTimeout(
+            seconds: OBDTiming.connectTimeoutSeconds,
+            timeoutError: .adapterNotFound
+        ) { finish in
+            self.ioThread.enqueue {
+                guard let eaSession = EASession(accessory: acc, forProtocol: self.protocolString),
+                      let input = eaSession.inputStream,
+                      let output = eaSession.outputStream else {
+                    finish(.failure(OBDTransportError.adapterNotFound))
+                    return
+                }
+                input.schedule(in: .current, forMode: .default)
+                output.schedule(in: .current, forMode: .default)
+                input.open()
+                output.open()
+                self.session = eaSession
+                self.isConnected = true
+                finish(.success(()))
+            }
+        }
+    }
+
+    public func disconnect() {
         isConnected = false
+        ioThread.enqueue { [weak self] in
+            self?.session?.inputStream?.close()
+            self?.session?.outputStream?.close()
+            self?.session = nil
+        }
     }
 
     public func sendCommand(_ command: String) async throws -> String {
-        guard isConnected, let out = session?.outputStream, let inp = session?.inputStream else {
-            throw OBDTransportError.notConnected
-        }
+        guard isConnected else { throw OBDTransportError.notConnected }
         let bytes = Array((command + "\r").utf8)
-        _ = out.write(bytes, maxLength: bytes.count)
-        var buffer = [UInt8](repeating: 0, count: 1024)
-        let readCount = inp.read(&buffer, maxLength: buffer.count)
-        guard readCount > 0 else { return "NO DATA\r\n>" }
-        return String(bytes: buffer.prefix(readCount), encoding: .utf8) ?? ""
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+            self.ioThread.enqueue {
+                guard let out = self.session?.outputStream, let inp = self.session?.inputStream else {
+                    cont.resume(throwing: OBDTransportError.notConnected)
+                    return
+                }
+                let deadline = Date().addingTimeInterval(OBDTiming.commandTimeoutSeconds)
+                var offset = 0
+                while offset < bytes.count {
+                    if Date() >= deadline {
+                        cont.resume(throwing: OBDTransportError.timeout)
+                        return
+                    }
+                    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+                    guard out.hasSpaceAvailable else { continue }
+                    let remaining = bytes[offset...]
+                    let written = remaining.withUnsafeBytes { raw -> Int in
+                        guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return -1 }
+                        return out.write(base, maxLength: bytes.count - offset)
+                    }
+                    if written <= 0 {
+                        cont.resume(throwing: OBDTransportError.connectionFailed("MFi write failed."))
+                        return
+                    }
+                    offset += written
+                }
+
+                var exchange = ELMCommandExchange(startedAt: Date())
+                var scratch = [UInt8](repeating: 0, count: 1024)
+                while true {
+                    if Date() >= deadline {
+                        cont.resume(throwing: OBDTransportError.timeout)
+                        return
+                    }
+                    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+                    guard inp.hasBytesAvailable else { continue }
+                    let readCount = inp.read(&scratch, maxLength: scratch.count)
+                    if readCount < 0 {
+                        cont.resume(throwing: OBDTransportError.connectionFailed("MFi read failed."))
+                        return
+                    }
+                    guard readCount > 0 else { continue }
+                    let chunk = String(bytes: scratch.prefix(readCount), encoding: .utf8) ?? ""
+                    switch exchange.ingest(chunk, now: Date()) {
+                    case .complete(let text):
+                        cont.resume(returning: text)
+                        return
+                    case .timedOut:
+                        cont.resume(throwing: OBDTransportError.timeout)
+                        return
+                    case .pending:
+                        continue
+                    }
+                }
+            }
+        }
     }
 }
 #endif
@@ -342,6 +656,11 @@ public final class GitLeafViewModel: ObservableObject {
     private var activeTripStartDate: Date?
     private var activeTripStartSoc: Double = 0
     private var activeTripStartKwh: Double = 0
+    private var activeTripStartOdometer: Int?
+    private var activeTripStartedLive = false
+    private var hasLiveBattery = false
+    private var hasLiveOdometer = false
+    private var pollTail: Task<Void, Never>?
 
     private let simulator = VirtualLeafTransport()
     private var activeTransport: OBDTransport?
@@ -349,6 +668,10 @@ public final class GitLeafViewModel: ObservableObject {
     private let interlock = SafetyInterlock()
     private let assembler = ISOTPAssembler()
     private var demoTick: Int = 0
+
+    private var isRealAdapterConnected: Bool {
+        activeTransport != nil && !(activeTransport is VirtualLeafTransport)
+    }
 
     private let sohStoreKey = "gitleaf_soh_history_v1"
     private let tripStoreKey = "gitleaf_trip_history_v1"
@@ -365,18 +688,13 @@ public final class GitLeafViewModel: ObservableObject {
     }
 
     private func loadPersistedHistory() {
-        if let data = UserDefaults.standard.data(forKey: sohStoreKey),
-           let decoded = try? JSONDecoder().decode([SOHSnapshot].self, from: data),
-           !decoded.isEmpty {
-            self.sohHistory = decoded
+        let persistedSOH: [SOHSnapshot]?
+        if let data = UserDefaults.standard.data(forKey: sohStoreKey) {
+            persistedSOH = try? JSONDecoder().decode([SOHSnapshot].self, from: data)
         } else {
-            let now = Date()
-            self.sohHistory = [
-                SOHSnapshot(date: now.addingTimeInterval(-86400 * 120), odometerKm: 58_400, sohPct: 91.2, hxPct: 86.8, ahr: 101.4, packTempC: 16.0),
-                SOHSnapshot(date: now.addingTimeInterval(-86400 * 60), odometerKm: 61_300, sohPct: 90.3, hxPct: 85.4, ahr: 100.2, packTempC: 19.0),
-                SOHSnapshot(date: now, odometerKm: 64_210, sohPct: 89.4, hxPct: 84.2, ahr: 99.3, packTempC: 18.0)
-            ]
+            persistedSOH = nil
         }
+        self.sohHistory = SOHHistoryLoader.initial(persisted: persistedSOH)
         if let data = UserDefaults.standard.data(forKey: tripStoreKey),
            let decoded = try? JSONDecoder().decode([TripRecord].self, from: data) {
             self.trips = decoded
@@ -384,62 +702,113 @@ public final class GitLeafViewModel: ObservableObject {
     }
 
     private func persistHistory() {
-        if let data = try? JSONEncoder().encode(sohHistory) {
+        let durableSOH = sohHistory.filter(\.fromLiveAdapter)
+        let durableTrips = trips.filter(\.fromLiveAdapter)
+        if let data = try? JSONEncoder().encode(durableSOH) {
             UserDefaults.standard.set(data, forKey: sohStoreKey)
         }
-        if let data = try? JSONEncoder().encode(trips) {
+        if let data = try? JSONEncoder().encode(durableTrips) {
             UserDefaults.standard.set(data, forKey: tripStoreKey)
         }
     }
 
     public func logSOHSnapshot() {
+        let liveSample = hasLiveBattery && isRealAdapterConnected
+        guard TelemetryPersistencePolicy.shouldPersistToHistory(
+            sourceIsLiveAdapter: liveSample,
+            realAdapterActive: isRealAdapterConnected
+        ) else {
+            statusBanner = "SOH history is recorded from a live adapter, not demo data."
+            return
+        }
         let snap = SOHSnapshot(
-            odometerKm: vcm.odometerKm,
+            odometerKm: hasLiveOdometer ? vcm.odometerKm : 0,
             sohPct: battery.sohPct,
             hxPct: battery.hxPct,
             ahr: battery.ahr,
-            packTempC: temps.avgC
+            packTempC: temps.avgC,
+            fromLiveAdapter: true
         )
         sohHistory.append(snap)
         persistHistory()
+        statusBanner = "SOH snapshot saved."
     }
 
     public func toggleTripRecording() {
         if isRecordingTrip {
-            let endedAt = Date()
-            let startedAt = activeTripStartDate ?? endedAt.addingTimeInterval(-600)
-            let usedKwh = max(0.2, abs(activeTripStartKwh - battery.remainingKwh) + (activeTransport is VirtualLeafTransport ? 2.4 : 0.0))
-            let distKm = max(1.2, (usedKwh * 1000.0) / 155.0)
-            let record = TripRecord(
-                startedAt: startedAt,
-                endedAt: endedAt,
-                distanceKm: (distKm * 10).rounded() / 10,
-                startSocPct: activeTripStartSoc,
-                endSocPct: battery.realSocPct,
-                energyUsedKwh: (usedKwh * 100).rounded() / 100,
-                regenKwh: (usedKwh * 0.18 * 100).rounded() / 100,
-                ambientTempC: vcm.ambientTempC
-            )
-            trips.insert(record, at: 0)
-            isRecordingTrip = false
-            persistHistory()
+            finishActiveTrip()
         } else {
             activeTripStartDate = Date()
             activeTripStartSoc = battery.realSocPct
             activeTripStartKwh = battery.remainingKwh
+            activeTripStartedLive = isRealAdapterConnected && hasLiveBattery
+            activeTripStartOdometer = (activeTripStartedLive && hasLiveOdometer) ? vcm.odometerKm : nil
             isRecordingTrip = true
         }
     }
 
+    private func finishActiveTrip() {
+        let endedAt = Date()
+        let startedAt = activeTripStartDate ?? endedAt
+        let startedLive = activeTripStartedLive
+        let stillLive = isRealAdapterConnected && hasLiveBattery
+        if startedLive != stillLive {
+            isRecordingTrip = false
+            activeTripStartedLive = false
+            statusBanner = "Trip discarded so demo data is not mixed into live history."
+            return
+        }
+        let used = TripMetrics.energyUsedKwh(startRemaining: activeTripStartKwh, endRemaining: battery.remainingKwh)
+        let regen = TripMetrics.regenKwh(startRemaining: activeTripStartKwh, endRemaining: battery.remainingKwh)
+        let distance = TripMetrics.distanceKm(
+            startOdometerKm: activeTripStartOdometer,
+            endOdometerKm: vcm.odometerKm,
+            energyUsedKwh: used,
+            odometerAvailable: startedLive && hasLiveOdometer && activeTripStartOdometer != nil
+        )
+        let record = TripRecord(
+            startedAt: startedAt,
+            endedAt: endedAt,
+            distanceKm: distance.distanceKm,
+            startSocPct: activeTripStartSoc,
+            endSocPct: battery.realSocPct,
+            energyUsedKwh: used,
+            regenKwh: regen,
+            ambientTempC: vcm.ambientTempC,
+            distanceIsEstimated: distance.isEstimated,
+            fromLiveAdapter: startedLive
+        )
+        trips.insert(record, at: 0)
+        isRecordingTrip = false
+        activeTripStartedLive = false
+        if TelemetryPersistencePolicy.shouldPersistToHistory(
+            sourceIsLiveAdapter: startedLive,
+            realAdapterActive: stillLive
+        ) {
+            persistHistory()
+        }
+    }
+
     public func disconnect() {
+        if isRecordingTrip {
+            finishActiveTrip()
+        }
         pollingTask?.cancel()
         pollingTask = nil
         activeTransport?.disconnect()
         activeTransport = nil
         isConnected = false
         isPolling = false
+        hasLiveBattery = false
+        hasLiveOdometer = false
         adapterWarning = nil
         statusBanner = "Disconnected — Ready"
+    }
+
+    private func invalidateSimulatedVehicleState() {
+        hasLiveBattery = false
+        hasLiveOdometer = false
+        vcm = LeafVCMState(speedKmh: 0, gear: "?", ambientTempC: 0, odometerKm: 0, climateKw: 0)
     }
 
     public func connectDemo() async {
@@ -468,6 +837,7 @@ public final class GitLeafViewModel: ObservableObject {
                 try await ble.connect()
                 activeTransport = ble
                 isConnected = true
+                invalidateSimulatedVehicleState()
                 try await initializeELM327(on: ble)
                 statusBanner = "Connected to \(ble.name) (\(adapterTier.rawValue))"
                 startLivePolling()
@@ -486,6 +856,7 @@ public final class GitLeafViewModel: ObservableObject {
                 try await wifi.connect()
                 activeTransport = wifi
                 isConnected = true
+                invalidateSimulatedVehicleState()
                 try await initializeELM327(on: wifi)
                 statusBanner = "Connected to \(wifi.name)"
                 startLivePolling()
@@ -500,6 +871,7 @@ public final class GitLeafViewModel: ObservableObject {
                 try await mfi.connect()
                 activeTransport = mfi
                 isConnected = true
+                invalidateSimulatedVehicleState()
                 try await initializeELM327(on: mfi)
                 statusBanner = "Connected to \(mfi.name)"
                 startLivePolling()
@@ -522,14 +894,12 @@ public final class GitLeafViewModel: ObservableObject {
         let fcsm = try await transport.sendCommand("ATFCSM1")
         if stn.uppercased().contains("STN") && !stn.contains("?") {
             adapterTier = .stnPro
-            adapterWarning = nil
         } else if !cfc.contains("?") && !fcsm.contains("?") && !elm.uppercased().contains("V2.1") {
             adapterTier = .elm327v15
-            adapterWarning = nil
         } else {
             adapterTier = .elm327CloneV21
-            adapterWarning = "Clone ELM327 v2.1 detected — using software-paced ISO-TP polling (1 Hz)."
         }
+        adapterWarning = AdapterPollSchedule.cloneWarning(for: adapterTier)
     }
 
     public func startLivePolling() {
@@ -539,13 +909,23 @@ public final class GitLeafViewModel: ObservableObject {
             while !Task.isCancelled {
                 guard let self, self.isConnected else { break }
                 await self.pollOnce()
-                let intervalNs: UInt64 = (self.adapterTier == .stnPro) ? 1_500_000_000 : 2_500_000_000
-                try? await Task.sleep(nanoseconds: intervalNs)
+                let interval = AdapterPollSchedule.intervalSeconds(for: self.adapterTier)
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
             }
         }
     }
 
     private func pollOnce() async {
+        let previous = pollTail
+        let next = Task { @MainActor [weak self] in
+            _ = await previous?.value
+            await self?.performPoll()
+        }
+        pollTail = next
+        await next.value
+    }
+
+    private func performPoll() async {
         guard let transport = activeTransport else { return }
         if transport is VirtualLeafTransport {
             demoTick += 1
@@ -572,53 +952,145 @@ public final class GitLeafViewModel: ObservableObject {
             self.vcm = snap.4
             self.dtcs = snap.5
             self.latencyMs = 12 + (demoTick % 6)
+            self.hasLiveBattery = false
+            self.hasLiveOdometer = false
             return
         }
 
         let start = Date()
-        do {
-            _ = try await transport.sendCommand("ATSH 79B")
-            let rawG1 = try await transport.sendCommand("21 01")
-            if let g1Bytes = try? assembler.assemble(rawELMResponse: rawG1, expectedRxID: 0x7BB),
+        lastPollFailed = false
+        var sawLive = false
+
+        if await query(transport, "ATSH 79B") != nil {
+            if let rawG1 = await query(transport, "21 01"),
+               let g1Bytes = try? assembler.assemble(rawELMResponse: rawG1, expectedRxID: 0x7BB),
                let summary = LeafCANParser.decodeLBCGroup1(g1Bytes, generation: selectedGeneration) {
                 self.battery = summary
+                self.hasLiveBattery = true
+                sawLive = true
             }
 
-            let rawG6 = try await transport.sendCommand("21 06")
-            let shunts = (try? assembler.assemble(rawELMResponse: rawG6, expectedRxID: 0x7BB))
-                .map { LeafCANParser.decodeLBCGroup6Shunts($0) } ?? []
+            let shunts: [Bool]
+            if let rawG6 = await query(transport, "21 06"),
+               let g6Bytes = try? assembler.assemble(rawELMResponse: rawG6, expectedRxID: 0x7BB) {
+                shunts = LeafCANParser.decodeLBCGroup6Shunts(g6Bytes)
+            } else {
+                shunts = []
+            }
 
-            let rawG2 = try await transport.sendCommand("21 02")
-            if let g2Bytes = try? assembler.assemble(rawELMResponse: rawG2, expectedRxID: 0x7BB),
+            if let rawG2 = await query(transport, "21 02"),
+               let g2Bytes = try? assembler.assemble(rawELMResponse: rawG2, expectedRxID: 0x7BB),
                let cellPack = LeafCANParser.decodeLBCGroup2Cells(g2Bytes, shunts: shunts) {
                 self.cells = cellPack
+                sawLive = true
             }
 
-            let rawG4 = try await transport.sendCommand("21 04")
-            if let g4Bytes = try? assembler.assemble(rawELMResponse: rawG4, expectedRxID: 0x7BB),
+            if let rawG4 = await query(transport, "21 04"),
+               let g4Bytes = try? assembler.assemble(rawELMResponse: rawG4, expectedRxID: 0x7BB),
                let therm = LeafCANParser.decodeLBCGroup4Temps(g4Bytes) {
                 self.temps = therm
+                sawLive = true
             }
 
-            let rawDTC = try await transport.sendCommand("19 02 FF")
-            if let dtcBytes = try? assembler.assemble(rawELMResponse: rawDTC, expectedRxID: 0x7BB) {
+            if let rawDTC = await query(transport, "19 02 FF"),
+               let dtcBytes = try? assembler.assemble(rawELMResponse: rawDTC, expectedRxID: 0x7BB) {
                 self.dtcs = LeafCANParser.decodeUDSDTCs(dtcBytes, ecu: "LBC")
+                sawLive = true
             }
+        }
 
-            _ = try await transport.sendCommand("ATSH 745")
-            let rawTPMS = try await transport.sendCommand("21 0E")
-            if let tpmsBytes = try? assembler.assemble(rawELMResponse: rawTPMS, expectedRxID: 0x765),
-               let parsedTpms = LeafCANParser.decodeTPMS(tpmsBytes) {
-                self.tpms = parsedTpms
-            }
+        if await query(transport, "ATSH 745") != nil,
+           let rawTPMS = await query(transport, "21 0E"),
+           let tpmsBytes = try? assembler.assemble(rawELMResponse: rawTPMS, expectedRxID: 0x765),
+           let parsedTpms = LeafCANParser.decodeTPMS(tpmsBytes) {
+            self.tpms = parsedTpms
+            sawLive = true
+        }
 
+        if await pollVehicleState(on: transport) {
+            sawLive = true
+        }
+
+        if sawLive {
             self.latencyMs = max(1, Int(Date().timeIntervalSince(start) * 1000))
-        } catch {
-            self.statusBanner = "Poll error: \(error.localizedDescription)"
+        }
+        if !lastPollFailed && sawLive && statusBanner.hasPrefix("Poll error:") {
+            statusBanner = "Connected to \(transport.name)"
         }
     }
 
+    private var lastPollFailed = false
+
+    private func query(_ transport: OBDTransport, _ command: String) async -> String? {
+        do {
+            return try await transport.sendCommand(command)
+        } catch {
+            lastPollFailed = true
+            statusBanner = "Poll error: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
+    /// VCM speed, gear, and ambient (`0x797`), plus cluster odometer (`0x743`).
+    private func pollVehicleState(on transport: OBDTransport) async -> Bool {
+        var gear = vcm.gear
+        var speed = vcm.speedKmh
+        var ambient = vcm.ambientTempC
+        var odometer = vcm.odometerKm
+        let climate = vcm.climateKw
+        var updated = false
+
+        if await query(transport, LeafVehicleQuery.vcmTxHeader) != nil {
+            if let raw = await query(transport, LeafVehicleQuery.gear),
+               let bytes = try? assembler.assemble(rawELMResponse: raw, expectedRxID: LeafVehicleQuery.vcmRxID),
+               let decoded = LeafCANParser.decodeVCMGear(bytes) {
+                gear = decoded
+                updated = true
+            }
+            if let raw = await query(transport, LeafVehicleQuery.speed),
+               let bytes = try? assembler.assemble(rawELMResponse: raw, expectedRxID: LeafVehicleQuery.vcmRxID),
+               let decoded = LeafCANParser.decodeVCMSpeedKmh(bytes) {
+                speed = decoded
+                updated = true
+            }
+            if let raw = await query(transport, LeafVehicleQuery.ambient),
+               let bytes = try? assembler.assemble(rawELMResponse: raw, expectedRxID: LeafVehicleQuery.vcmRxID),
+               let decoded = LeafCANParser.decodeVCMAmbientC(bytes) {
+                ambient = decoded
+                updated = true
+            }
+        }
+
+        if await query(transport, LeafVehicleQuery.meterTxHeader) != nil,
+           let raw = await query(transport, LeafVehicleQuery.odometer),
+           let bytes = try? assembler.assemble(rawELMResponse: raw, expectedRxID: LeafVehicleQuery.meterRxID),
+           let decoded = LeafCANParser.decodeOdometerKm(bytes) {
+            odometer = decoded
+            hasLiveOdometer = true
+            updated = true
+        }
+
+        if updated {
+            vcm = LeafVCMState(
+                speedKmh: speed,
+                gear: gear,
+                ambientTempC: ambient,
+                odometerKm: odometer,
+                climateKw: climate
+            )
+        }
+        return updated
+    }
+
     public func refreshTelemetry() {
+        if isRealAdapterConnected {
+            Task { await self.pollOnce() }
+        } else {
+            applySimulatorSnapshot()
+        }
+    }
+
+    private func applySimulatorSnapshot() {
         let snap = simulator.sampleSnapshot(generation: selectedGeneration)
         self.battery = snap.0
         self.cells = snap.1
@@ -626,6 +1098,8 @@ public final class GitLeafViewModel: ObservableObject {
         self.tpms = snap.3
         self.vcm = snap.4
         self.dtcs = snap.5
+        self.hasLiveBattery = false
+        self.hasLiveOdometer = false
     }
 
     public func executeServiceCommand(_ command: ServiceCommandType, confirmed: Bool) async -> Result<String, Error> {
@@ -640,10 +1114,13 @@ public final class GitLeafViewModel: ObservableObject {
             if let transport = activeTransport {
                 _ = try await transport.sendCommand(String(format: "ATSH %03X", txID))
                 _ = try await transport.sendCommand(hex)
-            } else if command == .clearDTCs {
-                _ = try await simulator.sendCommand("14 FF FF FF")
+                await pollOnce()
+            } else {
+                if command == .clearDTCs {
+                    _ = try await simulator.sendCommand("14 FF FF FF")
+                }
+                applySimulatorSnapshot()
             }
-            refreshTelemetry()
             return .success("\(command.rawValue) completed safely.")
         } catch {
             return .failure(error)
