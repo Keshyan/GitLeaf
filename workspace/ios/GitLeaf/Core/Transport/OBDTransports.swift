@@ -99,6 +99,14 @@ private func withTimeout<T: Sendable>(
     }
 }
 
+private func withVoidTimeout(
+    seconds: TimeInterval,
+    timeoutError: OBDTransportError = .timeout,
+    _ start: @escaping (@escaping (Result<Void, Error>) -> Void) -> Void
+) async throws {
+    try await withTimeout(seconds: seconds, timeoutError: timeoutError, start)
+}
+
 /// Built-in deterministic Virtual Nissan Leaf simulator so users can explore GitLeaf offline.
 public final class VirtualLeafTransport: OBDTransport {
     public let name = "Virtual Leaf ZE1 (40 kWh)"
@@ -377,10 +385,10 @@ public final class WiFiOBDTransport: OBDTransport {
         let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
         self.connection = conn
         do {
-            try await withTimeout(
+            try await withVoidTimeout(
                 seconds: OBDTiming.connectTimeoutSeconds,
                 timeoutError: .connectionFailed("Timed out waiting for the Wi-Fi adapter to become ready.")
-            ) { (finish: (Result<Void, Error>) -> Void) in
+            ) { finish in
                 conn.stateUpdateHandler = { state in
                     let decision = OBDConnectionWatch.decide(OBDConnectionWatch.phase(for: Self.event(for: state)))
                     switch decision {
@@ -438,7 +446,7 @@ public final class WiFiOBDTransport: OBDTransport {
     }
 
     private func transmit(_ conn: NWConnection, _ data: Data, timeoutSeconds: TimeInterval) async throws {
-        try await withTimeout(seconds: timeoutSeconds) { (finish: (Result<Void, Error>) -> Void) in
+        try await withVoidTimeout(seconds: timeoutSeconds) { finish in
             conn.send(content: data, completion: .contentProcessed { error in
                 if let error {
                     finish(.failure(error))
@@ -538,10 +546,10 @@ public final class MFiOBDTransport: OBDTransport {
         guard let acc = accessories.first(where: { $0.protocolStrings.contains(protocolString) }) else {
             throw OBDTransportError.adapterNotFound
         }
-        try await withTimeout(
+        try await withVoidTimeout(
             seconds: OBDTiming.connectTimeoutSeconds,
             timeoutError: .adapterNotFound
-        ) { (finish: (Result<Void, Error>) -> Void) in
+        ) { finish in
             self.ioThread.enqueue {
                 guard let eaSession = EASession(accessory: acc, forProtocol: self.protocolString),
                       let input = eaSession.inputStream,
