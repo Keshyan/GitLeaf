@@ -1,0 +1,58 @@
+name: GitLeaf CI (iOS + Protocol Core)
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  protocol-core-tests:
+    name: Python Protocol Core & Simulator Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install pytest ruff
+
+      - name: Lint & Run Protocol Core Test Suite
+        working-directory: workspace
+        run: |
+          ruff check --select E9,F63,F7,F82 .
+          pytest test_main.py -v
+
+  ios-build-and-test:
+    name: iOS SwiftUI Build & SwiftPM Tests
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: workspace/ios
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Swift Package Core Unit Tests
+        run: swift test --enable-code-coverage
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Build GitLeaf iOS App (Simulator)
+        run: |
+          xcodebuild \
+            -project GitLeaf.xcodeproj \
+            -scheme GitLeaf \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            build
