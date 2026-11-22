@@ -205,3 +205,35 @@ def test_09_elevation_aware_range_estimator():
     downhill = estimate_range_km(remaining_kwh=30.0, wh_per_km=155.0, elevation_gain_m=-600.0)
     assert uphill < flat < downhill
     assert len(encode_isotp_frames(b"\x61\x01\x02")) == 1
+
+
+def test_10_trip_csv_and_abrp_telemetry_export():
+    """Verify CSV trip export and ABRP live telemetry JSON formatting."""
+    from protocol_core.leaf_protocol import export_trips_csv, format_abrp_telemetry
+
+    sim = VirtualLeafOBDAdapter(generation=LeafGeneration.ZE1_40, pack_current_a=-18.0)
+    sim.send_command("ATSH 79B")
+    asm = ISOTPAssembler()
+    summary = decode_lbc_group1(asm.assemble_raw(sim.send_command("21 01"), expected_rx_id=0x7BB))
+    temps = decode_lbc_group4_temps(asm.assemble_raw(sim.send_command("21 04"), expected_rx_id=0x7BB))
+    vcm = LeafVCMState(speed_kmh=0.0, gear="P", ambient_temp_c=11.0, odometer_km=64_210, climate_kw=0.3)
+
+    abrp = format_abrp_telemetry(summary, temps, vcm, utc_timestamp=1700000000)
+    assert abrp["is_charging"] is True
+    assert abrp["soc"] == summary.real_soc_pct
+    assert abrp["odometer"] == 64_210
+
+    csv_text = export_trips_csv([
+        {
+            "started_at": "2026-11-22T08:00:00Z",
+            "ended_at": "2026-11-22T08:30:00Z",
+            "distance_km": 20.0,
+            "start_soc_pct": 80.0,
+            "end_soc_pct": 70.0,
+            "energy_used_kwh": 3.1,
+            "regen_kwh": 0.5,
+            "ambient_temp_c": 12.0,
+        }
+    ])
+    assert "started_at,ended_at,distance_km" in csv_text
+    assert "20.00,80.0,70.0,3.100,0.500,155,12.0" in csv_text

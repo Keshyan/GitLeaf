@@ -195,3 +195,36 @@ verify.py exited with code 0 after final Quality Optimizer pass.
 GitLeaf project is delivered and ready for Xcode / GitHub Actions CI.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
+
+```text
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💬 [COMMUNICATION]
+From:    Manager Agent
+To:      Senior Developer
+Phase:   Dev
+Cycle:   2 / 6
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Autonomous Milestone v1.1 kickoff:
+1. Add continuous OBD2 live polling (LBC 21 01/02/04/06, TPMS, DTCs)
+   and smooth Virtual Leaf live waveform to GitLeafViewModel.
+2. Add persistent SOH/Hx trend chart (Battery Lab), Live Trip Recorder,
+   and ShareLink CSV/ABRP export (Trip & Energy).
+3. Add custom Wi-Fi OBD2 host/port & clone warning UI (Adapter tab).
+4. Add unsigned iOS .ipa artifact build to GitHub Actions CI for
+   sideloading via AltStore / SideStore / Sideloadly.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+```text
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💬 [COMMUNICATION]
+From:    Senior Developer
+To:      QA Automation Engineer
+Phase:   QA
+Cycle:   2 / 6
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Milestone v1.1 implemented across SwiftUI app, GitLeafCoreTests,
+protocol_core, test_main.py, and .github/workflows/ios-ci.yml.
+Running dev-squad verify.py locally and pushing to trigger CI Run #3.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```

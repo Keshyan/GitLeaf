@@ -6,6 +6,44 @@ struct AdapterGarageView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("Connection Status") {
+                    HStack {
+                        Label(vm.isConnected ? "Connected (\(vm.adapterTier.rawValue))" : "Disconnected",
+                              systemImage: vm.isConnected ? "checkmark.circle.fill" : "bolt.slash")
+                            .foregroundStyle(vm.isConnected ? .mint : .secondary)
+                        Spacer()
+                        if vm.isConnected {
+                            Button("Disconnect", role: .destructive) {
+                                vm.disconnect()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                        }
+                    }
+                    if let warning = vm.adapterWarning {
+                        Label(warning, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                Section("Wi-Fi OBD2 Endpoint") {
+                    HStack {
+                        Text("Host IP")
+                        Spacer()
+                        TextField("192.168.0.10", text: $vm.wifiHost)
+                            .multilineTextAlignment(.trailing)
+                            .keyboardType(.numbersAndPunctuation)
+                    }
+                    HStack {
+                        Text("TCP Port")
+                        Spacer()
+                        TextField("35000", text: $vm.wifiPort)
+                            .multilineTextAlignment(.trailing)
+                            .keyboardType(.numberPad)
+                    }
+                }
+
                 Section("My Nissan Leaf Garage") {
                     Picker("Leaf Model / Battery", selection: $vm.selectedGeneration) {
                         ForEach(LeafGeneration.allCases) { gen in

@@ -319,10 +319,14 @@ public final class GitLeafViewModel: ObservableObject {
     @Published public var selectedGeneration: LeafGeneration = .ze1_40
     @Published public var selectedAdapter: AdapterSpec = AdapterCatalog.all.last!
     @Published public var isConnected: Bool = false
+    @Published public var isPolling: Bool = false
     @Published public var adapterTier: AdapterTier = .stnPro
+    @Published public var adapterWarning: String? = nil
     @Published public var latencyMs: Int = 18
     @Published public var readOnlySafeMode: Bool = true
     @Published public var elevationGainM: Double = 0.0
+    @Published public var wifiHost: String = "192.168.0.10"
+    @Published public var wifiPort: String = "35000"
     @Published public var statusBanner: String = "Ready — Tap Connect or Demo Mode"
 
     @Published public var battery: LeafBatterySummary
@@ -332,10 +336,22 @@ public final class GitLeafViewModel: ObservableObject {
     @Published public var vcm: LeafVCMState
     @Published public var dtcs: [DTCEntry]
 
+    @Published public var sohHistory: [SOHSnapshot] = []
+    @Published public var trips: [TripRecord] = []
+    @Published public var isRecordingTrip: Bool = false
+    private var activeTripStartDate: Date?
+    private var activeTripStartSoc: Double = 0
+    private var activeTripStartKwh: Double = 0
+
     private let simulator = VirtualLeafTransport()
     private var activeTransport: OBDTransport?
+    private var pollingTask: Task<Void, Never>?
     private let interlock = SafetyInterlock()
     private let assembler = ISOTPAssembler()
+    private var demoTick: Int = 0
+
+    private let sohStoreKey = "gitleaf_soh_history_v1"
+    private let tripStoreKey = "gitleaf_trip_history_v1"
 
     public init() {
         let initial = simulator.sampleSnapshot(generation: .ze1_40)
@@ -345,19 +361,102 @@ public final class GitLeafViewModel: ObservableObject {
         self.tpms = initial.3
         self.vcm = initial.4
         self.dtcs = initial.5
+        loadPersistedHistory()
+    }
+
+    private func loadPersistedHistory() {
+        if let data = UserDefaults.standard.data(forKey: sohStoreKey),
+           let decoded = try? JSONDecoder().decode([SOHSnapshot].self, from: data),
+           !decoded.isEmpty {
+            self.sohHistory = decoded
+        } else {
+            let now = Date()
+            self.sohHistory = [
+                SOHSnapshot(date: now.addingTimeInterval(-86400 * 120), odometerKm: 58_400, sohPct: 91.2, hxPct: 86.8, ahr: 101.4, packTempC: 16.0),
+                SOHSnapshot(date: now.addingTimeInterval(-86400 * 60), odometerKm: 61_300, sohPct: 90.3, hxPct: 85.4, ahr: 100.2, packTempC: 19.0),
+                SOHSnapshot(date: now, odometerKm: 64_210, sohPct: 89.4, hxPct: 84.2, ahr: 99.3, packTempC: 18.0)
+            ]
+        }
+        if let data = UserDefaults.standard.data(forKey: tripStoreKey),
+           let decoded = try? JSONDecoder().decode([TripRecord].self, from: data) {
+            self.trips = decoded
+        }
+    }
+
+    private func persistHistory() {
+        if let data = try? JSONEncoder().encode(sohHistory) {
+            UserDefaults.standard.set(data, forKey: sohStoreKey)
+        }
+        if let data = try? JSONEncoder().encode(trips) {
+            UserDefaults.standard.set(data, forKey: tripStoreKey)
+        }
+    }
+
+    public func logSOHSnapshot() {
+        let snap = SOHSnapshot(
+            odometerKm: vcm.odometerKm,
+            sohPct: battery.sohPct,
+            hxPct: battery.hxPct,
+            ahr: battery.ahr,
+            packTempC: temps.avgC
+        )
+        sohHistory.append(snap)
+        persistHistory()
+    }
+
+    public func toggleTripRecording() {
+        if isRecordingTrip {
+            let endedAt = Date()
+            let startedAt = activeTripStartDate ?? endedAt.addingTimeInterval(-600)
+            let usedKwh = max(0.2, abs(activeTripStartKwh - battery.remainingKwh) + (activeTransport is VirtualLeafTransport ? 2.4 : 0.0))
+            let distKm = max(1.2, (usedKwh * 1000.0) / 155.0)
+            let record = TripRecord(
+                startedAt: startedAt,
+                endedAt: endedAt,
+                distanceKm: (distKm * 10).rounded() / 10,
+                startSocPct: activeTripStartSoc,
+                endSocPct: battery.realSocPct,
+                energyUsedKwh: (usedKwh * 100).rounded() / 100,
+                regenKwh: (usedKwh * 0.18 * 100).rounded() / 100,
+                ambientTempC: vcm.ambientTempC
+            )
+            trips.insert(record, at: 0)
+            isRecordingTrip = false
+            persistHistory()
+        } else {
+            activeTripStartDate = Date()
+            activeTripStartSoc = battery.realSocPct
+            activeTripStartKwh = battery.remainingKwh
+            isRecordingTrip = true
+        }
+    }
+
+    public func disconnect() {
+        pollingTask?.cancel()
+        pollingTask = nil
+        activeTransport?.disconnect()
+        activeTransport = nil
+        isConnected = false
+        isPolling = false
+        adapterWarning = nil
+        statusBanner = "Disconnected — Ready"
     }
 
     public func connectDemo() async {
+        disconnect()
         try? await simulator.connect()
         activeTransport = simulator
         isConnected = true
         adapterTier = .stnPro
+        adapterWarning = nil
         latencyMs = 14
         statusBanner = "Connected to Virtual Leaf (\(selectedGeneration.displayName))"
         refreshTelemetry()
+        startLivePolling()
     }
 
     public func connectSelectedAdapter() async {
+        disconnect()
         switch selectedAdapter.transport {
         case .virtual:
             await connectDemo()
@@ -371,15 +470,17 @@ public final class GitLeafViewModel: ObservableObject {
                 isConnected = true
                 try await initializeELM327(on: ble)
                 statusBanner = "Connected to \(ble.name) (\(adapterTier.rawValue))"
+                startLivePolling()
             } catch {
                 statusBanner = error.localizedDescription
             }
             #endif
         case .wifiTCP:
             #if canImport(Network)
+            let parsedPort = UInt16(wifiPort) ?? (selectedAdapter.wifiPort ?? 35000)
             let wifi = WiFiOBDTransport(
-                host: selectedAdapter.wifiHost ?? "192.168.0.10",
-                port: selectedAdapter.wifiPort ?? 35000
+                host: wifiHost.isEmpty ? (selectedAdapter.wifiHost ?? "192.168.0.10") : wifiHost,
+                port: parsedPort
             )
             do {
                 try await wifi.connect()
@@ -387,6 +488,7 @@ public final class GitLeafViewModel: ObservableObject {
                 isConnected = true
                 try await initializeELM327(on: wifi)
                 statusBanner = "Connected to \(wifi.name)"
+                startLivePolling()
             } catch {
                 statusBanner = error.localizedDescription
             }
@@ -400,6 +502,7 @@ public final class GitLeafViewModel: ObservableObject {
                 isConnected = true
                 try await initializeELM327(on: mfi)
                 statusBanner = "Connected to \(mfi.name)"
+                startLivePolling()
             } catch {
                 statusBanner = error.localizedDescription
             }
@@ -419,10 +522,99 @@ public final class GitLeafViewModel: ObservableObject {
         let fcsm = try await transport.sendCommand("ATFCSM1")
         if stn.uppercased().contains("STN") && !stn.contains("?") {
             adapterTier = .stnPro
+            adapterWarning = nil
         } else if !cfc.contains("?") && !fcsm.contains("?") && !elm.uppercased().contains("V2.1") {
             adapterTier = .elm327v15
+            adapterWarning = nil
         } else {
             adapterTier = .elm327CloneV21
+            adapterWarning = "Clone ELM327 v2.1 detected — using software-paced ISO-TP polling (1 Hz)."
+        }
+    }
+
+    public func startLivePolling() {
+        pollingTask?.cancel()
+        isPolling = true
+        pollingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, self.isConnected else { break }
+                await self.pollOnce()
+                let intervalNs: UInt64 = (self.adapterTier == .stnPro) ? 1_500_000_000 : 2_500_000_000
+                try? await Task.sleep(nanoseconds: intervalNs)
+            }
+        }
+    }
+
+    private func pollOnce() async {
+        guard let transport = activeTransport else { return }
+        if transport is VirtualLeafTransport {
+            demoTick += 1
+            let snap = simulator.sampleSnapshot(generation: selectedGeneration)
+            let waveKw = (sin(Double(demoTick) * 0.6) * 2.4 * 100).rounded() / 100
+            let base = snap.0
+            self.battery = LeafBatterySummary(
+                packVoltageV: base.packVoltageV,
+                packCurrentA: ((waveKw * 1000.0 / base.packVoltageV) * 100).rounded() / 100,
+                powerKw: waveKw,
+                hxPct: base.hxPct,
+                realSocPct: base.realSocPct,
+                dashSocPct: base.dashSocPct,
+                ahr: base.ahr,
+                sohPct: base.sohPct,
+                gids: base.gids,
+                remainingKwh: base.remainingKwh,
+                qcCount: base.qcCount,
+                l1L2Count: base.l1L2Count
+            )
+            self.cells = snap.1
+            self.temps = snap.2
+            self.tpms = snap.3
+            self.vcm = snap.4
+            self.dtcs = snap.5
+            self.latencyMs = 12 + (demoTick % 6)
+            return
+        }
+
+        let start = Date()
+        do {
+            _ = try await transport.sendCommand("ATSH 79B")
+            let rawG1 = try await transport.sendCommand("21 01")
+            if let g1Bytes = try? assembler.assemble(rawELMResponse: rawG1, expectedRxID: 0x7BB),
+               let summary = LeafCANParser.decodeLBCGroup1(g1Bytes, generation: selectedGeneration) {
+                self.battery = summary
+            }
+
+            let rawG6 = try await transport.sendCommand("21 06")
+            let shunts = (try? assembler.assemble(rawELMResponse: rawG6, expectedRxID: 0x7BB))
+                .map { LeafCANParser.decodeLBCGroup6Shunts($0) } ?? []
+
+            let rawG2 = try await transport.sendCommand("21 02")
+            if let g2Bytes = try? assembler.assemble(rawELMResponse: rawG2, expectedRxID: 0x7BB),
+               let cellPack = LeafCANParser.decodeLBCGroup2Cells(g2Bytes, shunts: shunts) {
+                self.cells = cellPack
+            }
+
+            let rawG4 = try await transport.sendCommand("21 04")
+            if let g4Bytes = try? assembler.assemble(rawELMResponse: rawG4, expectedRxID: 0x7BB),
+               let therm = LeafCANParser.decodeLBCGroup4Temps(g4Bytes) {
+                self.temps = therm
+            }
+
+            let rawDTC = try await transport.sendCommand("19 02 FF")
+            if let dtcBytes = try? assembler.assemble(rawELMResponse: rawDTC, expectedRxID: 0x7BB) {
+                self.dtcs = LeafCANParser.decodeUDSDTCs(dtcBytes, ecu: "LBC")
+            }
+
+            _ = try await transport.sendCommand("ATSH 745")
+            let rawTPMS = try await transport.sendCommand("21 0E")
+            if let tpmsBytes = try? assembler.assemble(rawELMResponse: rawTPMS, expectedRxID: 0x765),
+               let parsedTpms = LeafCANParser.decodeTPMS(tpmsBytes) {
+                self.tpms = parsedTpms
+            }
+
+            self.latencyMs = max(1, Int(Date().timeIntervalSince(start) * 1000))
+        } catch {
+            self.statusBanner = "Poll error: \(error.localizedDescription)"
         }
     }
 

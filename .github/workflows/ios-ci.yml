@@ -56,3 +56,26 @@ jobs:
             -destination 'generic/platform=iOS Simulator' \
             CODE_SIGNING_ALLOWED=NO \
             build
+
+      - name: Build Unsigned iOS IPA (for AltStore / SideStore / Sideloadly)
+        run: |
+          xcodebuild \
+            -project GitLeaf.xcodeproj \
+            -scheme GitLeaf \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/GitLeaf.app Payload/
+          zip -r GitLeaf-unsigned.ipa Payload
+
+      - name: Upload Unsigned IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GitLeaf-unsigned-ipa
+          path: workspace/ios/GitLeaf-unsigned.ipa
+          retention-days: 30

@@ -364,3 +364,40 @@ class SafetyInterlock:
             return (0x745, bytes([0x31, 0x01, 0x02, 0x00]))
 
         raise ValueError(f"Unsupported service command: {command}")
+
+
+def format_abrp_telemetry(
+    summary: LeafBatterySummary,
+    temps: LeafThermistors,
+    vcm: LeafVCMState,
+    utc_timestamp: int,
+) -> dict[str, object]:
+    """Build an ABRP (A Better Routeplanner) Live Telemetry JSON payload."""
+    return {
+        "utc": utc_timestamp,
+        "soc": summary.real_soc_pct,
+        "soh": summary.soh_pct,
+        "power": summary.power_kw,
+        "speed": vcm.speed_kmh,
+        "is_charging": summary.power_kw < -1.0 and vcm.gear.upper() == "P",
+        "batt_temp": temps.avg_c,
+        "ext_temp": vcm.ambient_temp_c,
+        "odometer": vcm.odometer_km,
+    }
+
+
+def export_trips_csv(trips: list[dict[str, object]]) -> str:
+    """Export recorded Leaf trips to CSV format."""
+    header = "started_at,ended_at,distance_km,start_soc_pct,end_soc_pct,energy_used_kwh,regen_kwh,wh_per_km,ambient_temp_c"
+    rows = [header]
+    for t in trips:
+        dist = float(t.get("distance_km", 0.0))
+        kwh = float(t.get("energy_used_kwh", 0.0))
+        wh_per_km = round((kwh * 1000.0) / dist) if dist > 0.05 else 0
+        rows.append(
+            f"{t.get('started_at', '')},{t.get('ended_at', '')},{dist:.2f},"
+            f"{float(t.get('start_soc_pct', 0.0)):.1f},{float(t.get('end_soc_pct', 0.0)):.1f},"
+            f"{kwh:.3f},{float(t.get('regen_kwh', 0.0)):.3f},{wh_per_km},"
+            f"{float(t.get('ambient_temp_c', 0.0)):.1f}"
+        )
+    return "\n".join(rows)

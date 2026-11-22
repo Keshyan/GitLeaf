@@ -194,6 +194,37 @@ public enum LeafCANParser {
         )
     }
 
+    public static func decodeLBCGroup4Temps(_ payload: [UInt8]) -> LeafThermistors? {
+        guard payload.count >= 14, payload[0] == 0x61, payload[1] == 0x04 else { return nil }
+        var temps: [Double] = []
+        for i in 0..<4 {
+            let base = 2 + i * 3
+            if payload[base] == 0xFF && payload[base + 1] == 0xFF { continue }
+            let rawByte = payload[base + 2]
+            let signedTemp = Int8(bitPattern: rawByte)
+            temps.append(Double(signedTemp))
+        }
+        guard let minC = temps.min(), let maxC = temps.max() else { return nil }
+        let avgC = ((temps.reduce(0, +) / Double(temps.count)) * 10).rounded() / 10
+        let heater = payload.count > 14 ? (payload[14] & 0x01) != 0 : false
+        return LeafThermistors(tempsC: temps, minC: minC, maxC: maxC, avgC: avgC, heaterActive: heater)
+    }
+
+    public static func decodeLBCGroup6Shunts(_ payload: [UInt8]) -> [Bool] {
+        guard payload.count >= 26, payload[0] == 0x61, payload[1] == 0x06 else {
+            return Array(repeating: false, count: 96)
+        }
+        var shunts: [Bool] = []
+        shunts.reserveCapacity(96)
+        for mod in 0..<24 {
+            let nibble = payload[2 + mod] & 0x0F
+            for bit in 0..<4 {
+                shunts.append((nibble & (1 << bit)) != 0)
+            }
+        }
+        return shunts
+    }
+
     public static func decodeTPMS(_ payload: [UInt8]) -> LeafTPMS? {
         guard payload.count >= 6 else { return nil }
         return LeafTPMS(

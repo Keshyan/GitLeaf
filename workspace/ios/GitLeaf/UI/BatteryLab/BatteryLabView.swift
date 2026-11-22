@@ -55,6 +55,48 @@ struct BatteryLabView: View {
                         MetricCard(title: "QUICK CHARGES", value: "\(vm.battery.qcCount)", sub: "CHAdeMO DC Fast", accent: .yellow)
                         MetricCard(title: "L1 / L2 CHARGES", value: "\(vm.battery.l1L2Count)", sub: "AC Home / Public", accent: .green)
                     }
+
+                    // Historical SOH & Hx Degradation Trend
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text("SOH & Hx Health Trend")
+                                .font(.headline)
+                            Spacer()
+                            Button("Log Snapshot") {
+                                vm.logSOHSnapshot()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                        }
+
+                        Chart(vm.sohHistory) { snap in
+                            LineMark(
+                                x: .value("Date", snap.date),
+                                y: .value("SOH %", snap.sohPct)
+                            )
+                            .foregroundStyle(.mint)
+                            .symbol(.circle)
+
+                            LineMark(
+                                x: .value("Date", snap.date),
+                                y: .value("Hx %", snap.hxPct)
+                            )
+                            .foregroundStyle(.cyan)
+                            .lineStyle(StrokeStyle(lineWidth: 2, dash: [4, 3]))
+                        }
+                        .chartYScale(domain: 60...100)
+                        .frame(height: 150)
+
+                        HStack(spacing: 14) {
+                            Label("SOH %", systemImage: "line.diagonal").foregroundStyle(.mint)
+                            Label("Hx %", systemImage: "line.diagonal").foregroundStyle(.cyan)
+                            Spacer()
+                            Text("\(vm.sohHistory.count) logs").foregroundStyle(.secondary)
+                        }
+                        .font(.caption2)
+                    }
+                    .padding(14)
+                    .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
                 }
                 .padding()
             }

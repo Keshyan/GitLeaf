@@ -22,6 +22,53 @@ struct TripEnergyView: View {
                     RangeRow(label: "Highway (195 Wh/km)", km: LeafCANParser.estimateRangeKm(remainingKwh: vm.battery.remainingKwh, whPerKm: 195, elevationGainM: vm.elevationGainM), color: .orange)
                 }
 
+                Section("Live Trip Recorder & Export") {
+                    Button {
+                        vm.toggleTripRecording()
+                    } label: {
+                        Label(
+                            vm.isRecordingTrip ? "Stop & Save Trip" : "Start Recording Trip",
+                            systemImage: vm.isRecordingTrip ? "stop.circle.fill" : "record.circle"
+                        )
+                        .foregroundStyle(vm.isRecordingTrip ? .red : .mint)
+                    }
+
+                    ShareLink(
+                        item: TelemetryExporter.tripsToCSV(vm.trips),
+                        subject: Text("GitLeaf Trip History CSV")
+                    ) {
+                        Label("Export Trips as CSV (\(vm.trips.count))", systemImage: "square.and.arrow.up")
+                    }
+                    .disabled(vm.trips.isEmpty)
+
+                    ShareLink(
+                        item: TelemetryExporter.abrpJSON(battery: vm.battery, temps: vm.temps, vcm: vm.vcm),
+                        subject: Text("GitLeaf ABRP Live Telemetry JSON")
+                    ) {
+                        Label("Share ABRP Telemetry Snapshot", systemImage: "paperplane.fill")
+                    }
+                }
+
+                if !vm.trips.isEmpty {
+                    Section("Recorded Trips") {
+                        ForEach(vm.trips) { trip in
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(String(format: "%.1f km • %.0f Wh/km", trip.distanceKm, trip.whPerKm))
+                                        .font(.subheadline.weight(.semibold))
+                                    Text(String(format: "SoC %.0f%% → %.0f%% • Regen +%.2f kWh", trip.startSocPct, trip.endSocPct, trip.regenKwh))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Text(String(format: "%.2f kWh", trip.energyUsedKwh))
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.cyan)
+                            }
+                        }
+                    }
+                }
+
                 Section("Vehicle Telemetry") {
                     LabeledContent("Odometer", value: "\(vm.vcm.odometerKm) km")
                     LabeledContent("Ambient Temp", value: String(format: "%.1f °C", vm.vcm.ambientTempC))
