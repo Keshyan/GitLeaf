@@ -253,12 +253,16 @@ public final class BLEOBDTransport: NSObject, OBDTransport, CBCentralManagerDele
                 p.writeValue(payload, for: tx, type: writeType)
             }
         } catch {
-            ioLock.lock()
-            acceptingResponse = false
-            responseFinish = nil
-            ioLock.unlock()
+            clearPendingResponse()
             throw error
         }
+    }
+
+    private func clearPendingResponse() {
+        ioLock.lock()
+        acceptingResponse = false
+        responseFinish = nil
+        ioLock.unlock()
     }
 
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
@@ -376,7 +380,7 @@ public final class WiFiOBDTransport: OBDTransport {
             try await withTimeout(
                 seconds: OBDTiming.connectTimeoutSeconds,
                 timeoutError: .connectionFailed("Timed out waiting for the Wi-Fi adapter to become ready.")
-            ) { finish in
+            ) { (finish: (Result<Void, Error>) -> Void) in
                 conn.stateUpdateHandler = { state in
                     let decision = OBDConnectionWatch.decide(OBDConnectionWatch.phase(for: Self.event(for: state)))
                     switch decision {
@@ -434,7 +438,7 @@ public final class WiFiOBDTransport: OBDTransport {
     }
 
     private func transmit(_ conn: NWConnection, _ data: Data, timeoutSeconds: TimeInterval) async throws {
-        try await withTimeout(seconds: timeoutSeconds) { finish in
+        try await withTimeout(seconds: timeoutSeconds) { (finish: (Result<Void, Error>) -> Void) in
             conn.send(content: data, completion: .contentProcessed { error in
                 if let error {
                     finish(.failure(error))
@@ -537,7 +541,7 @@ public final class MFiOBDTransport: OBDTransport {
         try await withTimeout(
             seconds: OBDTiming.connectTimeoutSeconds,
             timeoutError: .adapterNotFound
-        ) { finish in
+        ) { (finish: (Result<Void, Error>) -> Void) in
             self.ioThread.enqueue {
                 guard let eaSession = EASession(accessory: acc, forProtocol: self.protocolString),
                       let input = eaSession.inputStream,
