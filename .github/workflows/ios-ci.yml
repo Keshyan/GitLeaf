@@ -31,7 +31,7 @@ jobs:
 
   ios-build-and-test:
     name: iOS SwiftUI Build & SwiftPM Tests
-    runs-on: macos-14
+    runs-on: macos-latest
     defaults:
       run:
         working-directory: workspace/ios
