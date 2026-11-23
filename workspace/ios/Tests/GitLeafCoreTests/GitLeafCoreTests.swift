@@ -198,9 +198,9 @@ final class GitLeafCoreTests: XCTestCase {
         XCTAssertFalse(firstOnly.contains(">"))
 
         let noisy = "SEARCHING...\rCAN ERROR\r7BB  06  61 0E 90 91 8E 7C 00\rNO DATA\r>"
-        let payload = try? ISOTPAssembler().assemble(rawELMResponse: noisy, expectedRxID: 0x765)
-        let tpms = payload.flatMap { LeafCANParser.decodeTPMS($0) }
-        XCTAssertEqual(try XCTUnwrap(tpms?.rrPsi), 31.0)
+        let payload = try ISOTPAssembler().assemble(rawELMResponse: noisy, expectedRxID: 0x7BB)
+        let tpms = try XCTUnwrap(LeafCANParser.decodeTPMS(payload))
+        XCTAssertEqual(tpms.rrPsi, 31.0)
 
         let echoed = "02 21 01\r7BB 04 61 0E 01 02 03 00\r>"
         let headed = ISOTPAssembler().parseELMLines(echoed, expectedRxID: 0x7BB)
