@@ -7,6 +7,85 @@ from enum import Enum
 from typing import Callable
 
 
+# Keep aligned with Swift `OBDTiming` in ELMSessionLogic.swift.
+OBD_COMMAND_TIMEOUT_S = 8.0
+OBD_CONNECT_TIMEOUT_S = 10.0
+
+
+class ELMResponseBuffer:
+    """Accumulate ELM327 chunks until the `>` prompt.
+
+    A 96-cell ISO-TP reply is larger than one BLE notification or one short TCP
+    read. Returning before the prompt truncates the pack.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = ""
+
+    def reset(self) -> None:
+        self._buffer = ""
+
+    def append(self, chunk: str) -> str | None:
+        if not chunk:
+            return None
+        self._buffer += chunk
+        if ">" not in self._buffer:
+            return None
+        idx = self._buffer.index(">")
+        complete = self._buffer[: idx + 1]
+        self._buffer = self._buffer[idx + 1 :]
+        return complete
+
+
+def elm_command_status(buffer: str, elapsed_s: float, timeout_s: float = OBD_COMMAND_TIMEOUT_S) -> str:
+    """Return complete, timeout, or pending for one ELM command exchange.
+
+    A prompt completes the exchange even when the deadline has just elapsed.
+    """
+    if ">" in buffer:
+        return "complete"
+    if elapsed_s >= timeout_s:
+        return "timeout"
+    return "pending"
+
+
+def elm_pci_request(data_hex: str) -> str:
+    """Prefix an ISO-TP single-frame length byte for ATCAF0.
+
+    ``21 01`` becomes ``02 21 01``. Requests longer than 7 bytes are returned unchanged.
+    """
+    parts = [part for part in data_hex.replace("\t", " ").split(" ") if part]
+    if not parts or len(parts) > 7 or any(len(part) != 2 for part in parts):
+        return data_hex.strip()
+    return f"{len(parts):02X} " + " ".join(parts)
+
+
+def needs_software_flow_control(raw: str) -> bool:
+    """True when the text has a first frame and not enough consecutive frames yet."""
+    from .isotp import parse_elm_hex_lines
+
+    frames = parse_elm_hex_lines(raw)
+    if not frames or len(frames[0].data) < 2:
+        return False
+    first = frames[0].data
+    if (first[0] & 0xF0) >> 4 != 0x1:
+        return False
+    total = ((first[0] & 0x0F) << 8) | first[1]
+    got = max(0, len(first) - 2)
+    expected = 1
+    for frame in frames[1:]:
+        if not frame.data:
+            continue
+        pci = frame.data[0]
+        kind = (pci & 0xF0) >> 4
+        if kind == 0x3:
+            continue
+        if kind == 0x2 and (pci & 0x0F) == expected:
+            got += max(0, len(frame.data) - 1)
+            expected = (expected + 1) & 0x0F
+    return got < total
+
+
 class AdapterTransportType(str, Enum):
     BLE = "BLE"
     WIFI_TCP = "WIFI_TCP"

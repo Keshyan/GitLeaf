@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-_NOISE_TOKENS = {
+_NOISE_EXACT = {
     "SEARCHING...",
     "NO DATA",
     "STOPPED",
@@ -13,7 +13,24 @@ _NOISE_TOKENS = {
     "OK",
     "?",
     "",
+    "BUFFER FULL",
+    "CAN ERROR",
+    "UNABLE TO CONNECT",
+    "BUS BUSY",
+    "BUS ERROR",
+    "DATA ERROR",
+    "FB ERROR",
+    "ERROR",
+    "ACT ALERT",
+    "LV RESET",
 }
+
+
+def _is_noise_line(line: str) -> bool:
+    upper = line.strip().upper()
+    if upper in _NOISE_EXACT:
+        return True
+    return upper.startswith(("SEARCHING", "BUS INIT", "CAN ERROR", "UNABLE TO CONNECT", "BUFFER FULL"))
 
 _HEX_BYTE_RE = re.compile(r"^[0-9A-Fa-f]+$")
 
@@ -41,9 +58,7 @@ def parse_elm_hex_lines(raw_response: str, expected_rx_id: int | None = None) ->
 
     for raw_line in cleaned.splitlines():
         line = raw_line.strip()
-        if not line or line.upper() in _NOISE_TOKENS:
-            continue
-        if line.upper().startswith("SEARCHING") or line.upper().startswith("BUS INIT"):
+        if not line or _is_noise_line(line):
             continue
 
         # Strip optional ELM327 CAF1 line index prefix like "0:" or "1:"

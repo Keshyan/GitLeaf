@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct TripEnergyView: View {
     @EnvironmentObject var vm: GitLeafViewModel
@@ -54,11 +55,18 @@ struct TripEnergyView: View {
                         ForEach(vm.trips) { trip in
                             HStack {
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text(String(format: "%.1f km • %.0f Wh/km", trip.distanceKm, trip.whPerKm))
+                                    Text(trip.distanceIsEstimated
+                                         ? String(format: "%.1f km (estimated) • %.0f Wh/km", trip.distanceKm, trip.whPerKm)
+                                         : String(format: "%.1f km • %.0f Wh/km", trip.distanceKm, trip.whPerKm))
                                         .font(.subheadline.weight(.semibold))
                                     Text(String(format: "SoC %.0f%% → %.0f%% • Regen +%.2f kWh", trip.startSocPct, trip.endSocPct, trip.regenKwh))
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
+                                    if !trip.fromLiveAdapter {
+                                        Text("Demo — not saved to history")
+                                            .font(.caption2)
+                                            .foregroundStyle(.orange)
+                                    }
                                 }
                                 Spacer()
                                 Text(String(format: "%.2f kWh", trip.energyUsedKwh))
@@ -104,6 +112,37 @@ struct DiagnosticsServiceView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("Raw Adapter Log") {
+                    if vm.telemetryPhase == .waiting {
+                        Text("Waiting for car data. Commands and adapter replies will appear here.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if vm.rawLogText.isEmpty {
+                        Text("No adapter traffic yet.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ScrollView {
+                            Text(vm.rawLogText)
+                                .font(.caption2.monospaced())
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
+                        }
+                        .frame(maxHeight: 280)
+                    }
+                    Button {
+                        UIPasteboard.general.string = vm.rawLogText
+                        feedbackMessage = "Raw log copied."
+                    } label: {
+                        Label("Copy Raw Log", systemImage: "doc.on.doc")
+                    }
+                    .disabled(vm.rawLogText.isEmpty)
+                    ShareLink(item: vm.rawLogText, subject: Text("GitLeaf OBD raw log")) {
+                        Label("Share Raw Log", systemImage: "square.and.arrow.up")
+                    }
+                    .disabled(vm.rawLogText.isEmpty)
+                }
+
                 Section("TPMS 4-Wheel Tire Pressure (PSI)") {
                     HStack {
                         TPMSBadge(wheel: "FL", psi: vm.tpms.flPsi)
@@ -114,7 +153,10 @@ struct DiagnosticsServiceView: View {
                 }
 
                 Section("Diagnostic Trouble Codes (\(vm.dtcs.count))") {
-                    if vm.dtcs.isEmpty {
+                    if vm.telemetryPhase == .waiting {
+                        Text("Waiting for car data")
+                            .foregroundStyle(.secondary)
+                    } else if vm.dtcs.isEmpty {
                         Label("All ECUs Clean — 0 Active DTCs", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.green)
                     } else {

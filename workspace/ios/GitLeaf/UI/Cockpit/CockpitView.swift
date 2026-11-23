@@ -10,12 +10,18 @@ struct CockpitView: View {
                     // Connection Status Pill
                     HStack {
                         Circle()
-                            .fill(vm.isConnected ? Color.green : Color.orange)
+                            .fill(statusColor)
                             .frame(width: 9, height: 9)
-                        Text(vm.isConnected ? "\(vm.selectedAdapter.displayName) • \(vm.latencyMs) ms" : vm.statusBanner)
+                        Text(statusText)
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
                         Spacer()
+                        Text(badgeTitle)
+                            .font(.caption2.weight(.bold))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(badgeColor.opacity(0.2), in: Capsule())
+                            .foregroundStyle(badgeColor)
                         if !vm.isConnected {
                             Button("Demo") {
                                 Task { await vm.connectDemo() }
@@ -45,12 +51,12 @@ struct CockpitView: View {
                             .animation(.spring(response: 0.6), value: vm.battery.realSocPct)
 
                         VStack(spacing: 4) {
-                            Text(String(format: "%.1f%%", vm.battery.realSocPct))
+                            Text(waiting ? "—" : String(format: "%.1f%%", vm.battery.realSocPct))
                                 .font(.system(size: 44, weight: .bold, design: .rounded))
-                            Text(String(format: "Dash %.1f%% • %d GIDs", vm.battery.dashSocPct, vm.battery.gids))
+                            Text(waiting ? "Waiting for car data" : String(format: "Dash %.1f%% • %d GIDs", vm.battery.dashSocPct, vm.battery.gids))
                                 .font(.caption.monospaced())
                                 .foregroundStyle(.secondary)
-                            Text(String(format: "%.2f kWh usable", vm.battery.remainingKwh))
+                            Text(waiting ? "—" : String(format: "%.2f kWh usable", vm.battery.remainingKwh))
                                 .font(.subheadline.weight(.semibold))
                                 .foregroundStyle(.mint)
                         }
@@ -60,13 +66,23 @@ struct CockpitView: View {
 
                     // 4-Tile Live Electrical & Health Grid
                     LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
-                        MetricCard(title: "LIVE POWER", value: String(format: "%+.2f kW", vm.battery.powerKw), sub: String(format: "%.1f V • %.1f A", vm.battery.packVoltageV, vm.battery.packCurrentA), accent: vm.battery.powerKw < 0 ? .green : .cyan)
-                        MetricCard(title: "BATTERY SOH", value: String(format: "%.1f%%", vm.battery.sohPct), sub: String(format: "Hx %.1f%% • %.1f Ah", vm.battery.hxPct, vm.battery.ahr), accent: .mint)
-                        MetricCard(title: "PACK TEMP", value: String(format: "%.1f °C", vm.temps.avgC), sub: String(format: "Min %.0f° / Max %.0f°", vm.temps.minC, vm.temps.maxC), accent: .orange)
-                        MetricCard(title: "EST. RANGE", value: String(format: "%.0f km", LeafCANParser.estimateRangeKm(remainingKwh: vm.battery.remainingKwh)), sub: "Normal (155 Wh/km)", accent: .blue)
+                        MetricCard(title: "LIVE POWER", value: waiting ? "—" : String(format: "%+.2f kW", vm.battery.powerKw), sub: waiting ? "Waiting for car data" : String(format: "%.1f V • %.1f A", vm.battery.packVoltageV, vm.battery.packCurrentA), accent: vm.battery.powerKw < 0 ? .green : .cyan)
+                        MetricCard(title: "BATTERY SOH", value: waiting ? "—" : String(format: "%.1f%%", vm.battery.sohPct), sub: waiting ? "—" : String(format: "Hx %.1f%% • %.1f Ah", vm.battery.hxPct, vm.battery.ahr), accent: .mint)
+                        MetricCard(title: "PACK TEMP", value: waiting ? "—" : String(format: "%.1f °C", vm.temps.avgC), sub: waiting ? "—" : String(format: "Min %.0f° / Max %.0f°", vm.temps.minC, vm.temps.maxC), accent: .orange)
+                        MetricCard(title: "EST. RANGE", value: waiting ? "—" : String(format: "%.0f km", LeafCANParser.estimateRangeKm(remainingKwh: vm.battery.remainingKwh)), sub: waiting ? "—" : "Normal (155 Wh/km)", accent: .blue)
                     }
 
-                    // Quick TPMS Alert Strip
+                    if waiting {
+                        HStack {
+                            Image(systemName: "antenna.radiowaves.left.and.right")
+                                .foregroundStyle(.yellow)
+                            Text(vm.statusBanner)
+                                .font(.footnote.weight(.medium))
+                            Spacer()
+                        }
+                        .padding(14)
+                        .background(Color.yellow.opacity(0.14), in: RoundedRectangle(cornerRadius: 14))
+                    } else {
                     let lowWheels = vm.tpms.lowPressureWheels()
                     HStack {
                         Image(systemName: lowWheels.isEmpty ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
@@ -79,10 +95,48 @@ struct CockpitView: View {
                     }
                     .padding(14)
                     .background(lowWheels.isEmpty ? Color.green.opacity(0.12) : Color.yellow.opacity(0.14), in: RoundedRectangle(cornerRadius: 14))
+                    }
                 }
                 .padding()
             }
             .navigationTitle("GitLeaf Cockpit")
+        }
+    }
+
+    private var waiting: Bool { vm.telemetryPhase == .waiting }
+
+    private var statusColor: Color {
+        switch vm.telemetryPhase {
+        case .live: return .green
+        case .waiting: return .yellow
+        case .demo: return vm.isConnected ? .orange : .orange
+        }
+    }
+
+    private var badgeTitle: String {
+        switch vm.telemetryPhase {
+        case .live: return "LIVE"
+        case .waiting: return "WAITING"
+        case .demo: return "DEMO"
+        }
+    }
+
+    private var badgeColor: Color {
+        switch vm.telemetryPhase {
+        case .live: return .green
+        case .waiting: return .yellow
+        case .demo: return .orange
+        }
+    }
+
+    private var statusText: String {
+        switch vm.telemetryPhase {
+        case .live:
+            return "\(vm.selectedAdapter.displayName) • \(vm.latencyMs) ms"
+        case .waiting:
+            return "Waiting for car data"
+        case .demo:
+            return vm.isConnected ? "\(vm.selectedAdapter.displayName) • \(vm.latencyMs) ms" : vm.statusBanner
         }
     }
 }
