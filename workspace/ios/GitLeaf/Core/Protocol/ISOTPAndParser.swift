@@ -26,13 +26,14 @@ public struct ISOTPAssembler: Sendable {
 
     public func parseELMLines(_ raw: String, expectedRxID: UInt16? = nil) -> [[UInt8]] {
         let cleaned = raw.replacingOccurrences(of: "\r", with: "\n").replacingOccurrences(of: ">", with: "")
-        var result: [[UInt8]] = []
+        var headed: [[UInt8]] = []
+        var headerless: [[UInt8]] = []
 
         for rawLine in cleaned.split(separator: "\n") {
             var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             if line.isEmpty { continue }
             let upper = line.uppercased()
-            if ["NO DATA", "STOPPED", "OK", "?"].contains(upper) || upper.hasPrefix("SEARCHING") { continue }
+            if Self.isNoiseLine(upper) { continue }
 
             if line.count >= 2 && line[line.index(line.startIndex, offsetBy: 1)] == ":" {
                 line = String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
@@ -54,10 +55,31 @@ public struct ISOTPAssembler: Sendable {
             }
 
             if let bytes = hexToBytes(hexPayload), !bytes.isEmpty {
-                result.append(bytes)
+                if arbID != nil {
+                    headed.append(bytes)
+                } else {
+                    headerless.append(bytes)
+                }
             }
         }
-        return result
+        if expectedRxID != nil && !headed.isEmpty {
+            return headed
+        }
+        return headed + headerless
+    }
+
+    /// Clone adapters interleave status text with CAN frames. Those lines are not frames.
+    public static func isNoiseLine(_ uppercasedLine: String) -> Bool {
+        let upper = uppercasedLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        if upper.isEmpty { return true }
+        let exact: Set<String> = [
+            "NO DATA", "STOPPED", "OK", "?", "BUFFER FULL", "CAN ERROR",
+            "UNABLE TO CONNECT", "BUS BUSY", "BUS ERROR", "DATA ERROR",
+            "FB ERROR", "ERROR", "ACT ALERT", "LV RESET"
+        ]
+        if exact.contains(upper) { return true }
+        let prefixes = ["SEARCHING", "BUS INIT", "CAN ERROR", "UNABLE TO CONNECT", "BUFFER FULL"]
+        return prefixes.contains { upper.hasPrefix($0) }
     }
 
     public func assemble(frames: [[UInt8]]) throws -> [UInt8] {
@@ -179,6 +201,25 @@ public enum LeafCANParser {
             remainingKwh: (remainingKwh * 100).rounded() / 100,
             qcCount: qcCount,
             l1L2Count: l1L2Count
+        )
+    }
+
+    public struct LBCGroup61 {
+        public let sohPct: Double
+        public let gids: Int
+        public let usableKwh: Double
+    }
+
+    /// ZE1 `21 61` -> `61 61` high-resolution SOH, GIDs, and usable kWh.
+    public static func decodeLBCGroup61(_ payload: [UInt8]) -> LBCGroup61? {
+        guard payload.count >= 8, payload[0] == 0x61, payload[1] == 0x61 else { return nil }
+        let soh = Double((UInt16(payload[2]) << 8) | UInt16(payload[3])) / 100.0
+        let gids = Int((UInt16(payload[4]) << 8) | UInt16(payload[5]))
+        let kwh = Double((UInt16(payload[6]) << 8) | UInt16(payload[7])) / 100.0
+        return LBCGroup61(
+            sohPct: (soh * 100).rounded() / 100,
+            gids: gids,
+            usableKwh: (kwh * 100).rounded() / 100
         )
     }
 

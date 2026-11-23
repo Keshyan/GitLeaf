@@ -142,17 +142,17 @@ public final class VirtualLeafTransport: OBDTransport {
     }
 
     public func sampleSnapshot(generation: LeafGeneration) -> (LeafBatterySummary, LeafCellPack, LeafThermistors, LeafTPMS, LeafVCMState, [DTCEntry]) {
-        let gids = Int(Double(generation.maxGids) * 0.765 * 0.894)
-        let remKwh = ((Double(gids) * generation.whPerGid) / 1000.0 * 100).rounded() / 100
+        let gids = DemoLeafSnapshot.gids(maxGids: generation.maxGids)
+        let remKwh = DemoLeafSnapshot.remainingKwh(gids: gids, whPerGid: generation.whPerGid)
         let summary = LeafBatterySummary(
-            packVoltageV: 368.4,
+            packVoltageV: DemoLeafSnapshot.packVoltageV,
             packCurrentA: 12.5,
             powerKw: 4.61,
-            hxPct: 84.2,
-            realSocPct: 76.5,
-            dashSocPct: 77.7,
-            ahr: 99.3,
-            sohPct: 89.4,
+            hxPct: DemoLeafSnapshot.hxPct,
+            realSocPct: DemoLeafSnapshot.realSocPct,
+            dashSocPct: DemoLeafSnapshot.dashSocPct,
+            ahr: DemoLeafSnapshot.ahr,
+            sohPct: DemoLeafSnapshot.sohPct,
             gids: gids,
             remainingKwh: remKwh,
             qcCount: 47,
@@ -178,7 +178,7 @@ public final class VirtualLeafTransport: OBDTransport {
             shuntActive: shunts
         )
         let temps = LeafThermistors(tempsC: [18.0, 19.0, 18.0, 17.0], minC: 17.0, maxC: 19.0, avgC: 18.0, heaterActive: false)
-        let tpms = LeafTPMS(flPsi: 36.0, frPsi: 36.25, rlPsi: 35.5, rrPsi: 31.0)
+        let tpms = LeafTPMS(flPsi: 36.0, frPsi: 36.25, rlPsi: 35.5, rrPsi: DemoLeafSnapshot.rrPsi)
         let vcm = LeafVCMState(speedKmh: 0.0, gear: "P", ambientTempC: 14.5, odometerKm: 64_210, climateKw: 0.4)
         let dtcs: [DTCEntry] = clearedDTCs ? [] : [
             DTCEntry(ecu: "LBC", code: "P3173", statusByte: 0x09, description: "LBC Battery Cell Voltage Sensor Fault", severity: "CRITICAL"),
@@ -261,9 +261,20 @@ public final class BLEOBDTransport: NSObject, OBDTransport, CBCentralManagerDele
                 p.writeValue(payload, for: tx, type: writeType)
             }
         } catch {
+            let partial = snapshotCommandBuffer()
             clearPendingResponse()
+            if ELMResponseRecovery.containsCANFrames(partial) {
+                return partial
+            }
             throw error
         }
+    }
+
+    private func snapshotCommandBuffer() -> String {
+        ioLock.lock()
+        let text = commandExchange.accumulator.buffer
+        ioLock.unlock()
+        return text
     }
 
     private func clearPendingResponse() {
@@ -431,6 +442,10 @@ public final class WiFiOBDTransport: OBDTransport {
         while true {
             let remaining = budget - Date().timeIntervalSince(started)
             if remaining <= 0 {
+                let partial = exchange.accumulator.buffer
+                if ELMResponseRecovery.containsCANFrames(partial) {
+                    return partial
+                }
                 throw OBDTransportError.timeout
             }
             let chunk = try await receiveChunk(conn, timeoutSeconds: remaining)
@@ -438,6 +453,10 @@ public final class WiFiOBDTransport: OBDTransport {
             case .complete(let text):
                 return text
             case .timedOut:
+                let partial = exchange.accumulator.buffer
+                if ELMResponseRecovery.containsCANFrames(partial) {
+                    return partial
+                }
                 throw OBDTransportError.timeout
             case .pending:
                 continue
@@ -611,7 +630,12 @@ public final class MFiOBDTransport: OBDTransport {
                 var scratch = [UInt8](repeating: 0, count: 1024)
                 while true {
                     if Date() >= deadline {
-                        cont.resume(throwing: OBDTransportError.timeout)
+                        let partial = exchange.accumulator.buffer
+                        if ELMResponseRecovery.containsCANFrames(partial) {
+                            cont.resume(returning: partial)
+                        } else {
+                            cont.resume(throwing: OBDTransportError.timeout)
+                        }
                         return
                     }
                     RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
@@ -628,7 +652,12 @@ public final class MFiOBDTransport: OBDTransport {
                         cont.resume(returning: text)
                         return
                     case .timedOut:
-                        cont.resume(throwing: OBDTransportError.timeout)
+                        let partial = exchange.accumulator.buffer
+                        if ELMResponseRecovery.containsCANFrames(partial) {
+                            cont.resume(returning: partial)
+                        } else {
+                            cont.resume(throwing: OBDTransportError.timeout)
+                        }
                         return
                     case .pending:
                         continue
@@ -654,6 +683,17 @@ public final class GitLeafViewModel: ObservableObject {
     @Published public var wifiHost: String = "192.168.0.10"
     @Published public var wifiPort: String = "35000"
     @Published public var statusBanner: String = "Ready — Tap Connect or Demo Mode"
+    @Published public private(set) var rawLogLines: [String] = []
+
+    public var rawLogText: String { rawLogLines.joined(separator: "\n") }
+
+    public var telemetryPhase: TelemetryPhase {
+        LiveDisplayPolicy.phase(
+            realAdapterConnected: isRealAdapterConnected,
+            hasDecodedLiveBattery: hasLiveBattery,
+            demoTransportActive: activeTransport is VirtualLeafTransport
+        )
+    }
 
     @Published public var battery: LeafBatterySummary
     @Published public var cells: LeafCellPack
@@ -825,6 +865,7 @@ public final class GitLeafViewModel: ObservableObject {
 
     public func connectDemo() async {
         disconnect()
+        rawLogLines = []
         try? await simulator.connect()
         activeTransport = simulator
         isConnected = true
@@ -838,6 +879,7 @@ public final class GitLeafViewModel: ObservableObject {
 
     public func connectSelectedAdapter() async {
         disconnect()
+        rawLogLines = []
         switch selectedAdapter.transport {
         case .virtual:
             await connectDemo()
@@ -849,7 +891,7 @@ public final class GitLeafViewModel: ObservableObject {
                 try await ble.connect()
                 activeTransport = ble
                 isConnected = true
-                invalidateSimulatedVehicleState()
+                beginLiveSession()
                 try await initializeELM327(on: ble)
                 statusBanner = "Connected to \(ble.name) (\(adapterTier.rawValue))"
                 startLivePolling()
@@ -868,7 +910,7 @@ public final class GitLeafViewModel: ObservableObject {
                 try await wifi.connect()
                 activeTransport = wifi
                 isConnected = true
-                invalidateSimulatedVehicleState()
+                beginLiveSession()
                 try await initializeELM327(on: wifi)
                 statusBanner = "Connected to \(wifi.name)"
                 startLivePolling()
@@ -883,7 +925,7 @@ public final class GitLeafViewModel: ObservableObject {
                 try await mfi.connect()
                 activeTransport = mfi
                 isConnected = true
-                invalidateSimulatedVehicleState()
+                beginLiveSession()
                 try await initializeELM327(on: mfi)
                 statusBanner = "Connected to \(mfi.name)"
                 startLivePolling()
@@ -896,14 +938,40 @@ public final class GitLeafViewModel: ObservableObject {
         }
     }
 
+    private func beginLiveSession() {
+        hasLiveBattery = false
+        hasLiveOdometer = false
+        battery = LeafBatterySummary(
+            packVoltageV: 0, packCurrentA: 0, powerKw: 0, hxPct: 0,
+            realSocPct: 0, dashSocPct: 0, ahr: 0, sohPct: 0,
+            gids: 0, remainingKwh: 0, qcCount: 0, l1L2Count: 0
+        )
+        cells = LeafCellPack(
+            voltagesMv: Array(repeating: 0, count: 96),
+            minMv: 0, maxMv: 0, avgMv: 0, deltaMv: 0,
+            weakCellIndices: [],
+            shuntActive: Array(repeating: false, count: 96)
+        )
+        temps = LeafThermistors(tempsC: [], minC: 0, maxC: 0, avgC: 0, heaterActive: false)
+        tpms = LeafTPMS(flPsi: 0, frPsi: 0, rlPsi: 0, rrPsi: 0)
+        vcm = LeafVCMState(speedKmh: 0, gear: "?", ambientTempC: 0, odometerKm: 0, climateKw: 0)
+        dtcs = []
+        statusBanner = "Waiting for car data"
+    }
+
     private func initializeELM327(on transport: OBDTransport) async throws {
-        for cmd in ["ATZ", "ATE0", "ATL0", "ATS0", "ATH1", "ATSP6", "ATCAF0"] {
-            _ = try await transport.sendCommand(cmd)
+        _ = try await sendLogged(transport, "ATZ")
+        try await Task.sleep(nanoseconds: 800_000_000)
+        for cmd in ["ATE0", "ATL0", "ATS0", "ATH1", "ATSP6", "ATCAF0"] {
+            _ = try await sendLogged(transport, cmd)
         }
-        let elm = try await transport.sendCommand("ATI")
-        let stn = try await transport.sendCommand("STI")
-        let cfc = try await transport.sendCommand("ATCFC1")
-        let fcsm = try await transport.sendCommand("ATFCSM1")
+        for cmd in ["ATAT1", "ATAL", "ATST96"] {
+            _ = await tryCommand(transport, cmd)
+        }
+        let elm = try await sendLogged(transport, "ATI")
+        let stn = try await sendLogged(transport, "STI")
+        let cfc = (await tryCommand(transport, "ATCFC1")) ?? "?"
+        let fcsm = (await tryCommand(transport, "ATFCSM1")) ?? "?"
         if stn.uppercased().contains("STN") && !stn.contains("?") {
             adapterTier = .stnPro
         } else if !cfc.contains("?") && !fcsm.contains("?") && !elm.uppercased().contains("V2.1") {
@@ -912,6 +980,9 @@ public final class GitLeafViewModel: ObservableObject {
             adapterTier = .elm327CloneV21
         }
         adapterWarning = AdapterPollSchedule.cloneWarning(for: adapterTier)
+        if !hasLiveBattery {
+            statusBanner = "Waiting for car data"
+        }
     }
 
     public func startLivePolling() {
@@ -940,13 +1011,15 @@ public final class GitLeafViewModel: ObservableObject {
     private func performPoll() async {
         guard let transport = activeTransport else { return }
         if transport is VirtualLeafTransport {
+            guard !isRealAdapterConnected else { return }
             demoTick += 1
             let snap = simulator.sampleSnapshot(generation: selectedGeneration)
-            let waveKw = (sin(Double(demoTick) * 0.6) * 2.4 * 100).rounded() / 100
+            let waveKw = DemoLeafSnapshot.powerKw(tick: demoTick)
             let base = snap.0
+            guard let current = activeTransport, current === transport, !isRealAdapterConnected else { return }
             self.battery = LeafBatterySummary(
                 packVoltageV: base.packVoltageV,
-                packCurrentA: ((waveKw * 1000.0 / base.packVoltageV) * 100).rounded() / 100,
+                packCurrentA: DemoLeafSnapshot.currentAmps(powerKw: waveKw, packVoltageV: base.packVoltageV),
                 powerKw: waveKw,
                 hxPct: base.hxPct,
                 realSocPct: base.realSocPct,
@@ -963,7 +1036,7 @@ public final class GitLeafViewModel: ObservableObject {
             self.tpms = snap.3
             self.vcm = snap.4
             self.dtcs = snap.5
-            self.latencyMs = 12 + (demoTick % 6)
+            self.latencyMs = DemoLeafSnapshot.latencyMs(tick: demoTick)
             self.hasLiveBattery = false
             self.hasLiveOdometer = false
             return
@@ -973,46 +1046,68 @@ public final class GitLeafViewModel: ObservableObject {
         lastPollFailed = false
         var sawLive = false
 
-        if await query(transport, "ATSH 79B") != nil {
-            if let rawG1 = await query(transport, "21 01"),
+        if await selectECU(transport, header: "79B") {
+            if let rawG1 = await queryISO(transport, "21 01"),
                let g1Bytes = try? assembler.assemble(rawELMResponse: rawG1, expectedRxID: 0x7BB),
                let summary = LeafCANParser.decodeLBCGroup1(g1Bytes, generation: selectedGeneration) {
                 self.battery = summary
                 self.hasLiveBattery = true
+                self.statusBanner = "Live data from \(transport.name)"
                 sawLive = true
             }
 
+            if (selectedGeneration == .ze1_40 || selectedGeneration == .ze1_62),
+               let rawG61 = await queryISO(transport, "21 61"),
+               let g61 = try? assembler.assemble(rawELMResponse: rawG61, expectedRxID: 0x7BB),
+               let extended = LeafCANParser.decodeLBCGroup61(g61),
+               hasLiveBattery {
+                self.battery = LeafBatterySummary(
+                    packVoltageV: battery.packVoltageV,
+                    packCurrentA: battery.packCurrentA,
+                    powerKw: battery.powerKw,
+                    hxPct: battery.hxPct,
+                    realSocPct: battery.realSocPct,
+                    dashSocPct: battery.dashSocPct,
+                    ahr: battery.ahr,
+                    sohPct: extended.sohPct,
+                    gids: extended.gids,
+                    remainingKwh: extended.usableKwh,
+                    qcCount: battery.qcCount,
+                    l1L2Count: battery.l1L2Count
+                )
+            }
+
             let shunts: [Bool]
-            if let rawG6 = await query(transport, "21 06"),
+            if let rawG6 = await queryISO(transport, "21 06"),
                let g6Bytes = try? assembler.assemble(rawELMResponse: rawG6, expectedRxID: 0x7BB) {
                 shunts = LeafCANParser.decodeLBCGroup6Shunts(g6Bytes)
             } else {
                 shunts = []
             }
 
-            if let rawG2 = await query(transport, "21 02"),
+            if let rawG2 = await queryISO(transport, "21 02"),
                let g2Bytes = try? assembler.assemble(rawELMResponse: rawG2, expectedRxID: 0x7BB),
                let cellPack = LeafCANParser.decodeLBCGroup2Cells(g2Bytes, shunts: shunts) {
                 self.cells = cellPack
                 sawLive = true
             }
 
-            if let rawG4 = await query(transport, "21 04"),
+            if let rawG4 = await queryISO(transport, "21 04"),
                let g4Bytes = try? assembler.assemble(rawELMResponse: rawG4, expectedRxID: 0x7BB),
                let therm = LeafCANParser.decodeLBCGroup4Temps(g4Bytes) {
                 self.temps = therm
                 sawLive = true
             }
 
-            if let rawDTC = await query(transport, "19 02 FF"),
+            if let rawDTC = await queryISO(transport, "19 02 FF"),
                let dtcBytes = try? assembler.assemble(rawELMResponse: rawDTC, expectedRxID: 0x7BB) {
                 self.dtcs = LeafCANParser.decodeUDSDTCs(dtcBytes, ecu: "LBC")
                 sawLive = true
             }
         }
 
-        if await query(transport, "ATSH 745") != nil,
-           let rawTPMS = await query(transport, "21 0E"),
+        if await selectECU(transport, header: "745"),
+           let rawTPMS = await queryISO(transport, "21 0E"),
            let tpmsBytes = try? assembler.assemble(rawELMResponse: rawTPMS, expectedRxID: 0x765),
            let parsedTpms = LeafCANParser.decodeTPMS(tpmsBytes) {
             self.tpms = parsedTpms
@@ -1033,14 +1128,59 @@ public final class GitLeafViewModel: ObservableObject {
 
     private var lastPollFailed = false
 
+    private func sendLogged(_ transport: OBDTransport, _ command: String) async throws -> String {
+        appendTrace("TX", command)
+        do {
+            let response = try await transport.sendCommand(command)
+            appendTrace("RX", response)
+            return response
+        } catch {
+            appendTrace("RX", "ERROR \(error.localizedDescription)")
+            throw error
+        }
+    }
+
+    private func tryCommand(_ transport: OBDTransport, _ command: String) async -> String? {
+        try? await sendLogged(transport, command)
+    }
+
     private func query(_ transport: OBDTransport, _ command: String) async -> String? {
         do {
-            return try await transport.sendCommand(command)
+            return try await sendLogged(transport, command)
         } catch {
-            lastPollFailed = true
-            statusBanner = "Poll error: \(error.localizedDescription)"
+            notePollFailure(error)
             return nil
         }
+    }
+
+    private func selectECU(_ transport: OBDTransport, header: String) async -> Bool {
+        guard await query(transport, "ATSH \(header)") != nil else { return false }
+        _ = await tryCommand(transport, "ATFCSH \(header)")
+        _ = await tryCommand(transport, "ATFCSD 30 00 00")
+        return true
+    }
+
+    /// Send an ISO-TP request with the PCI length byte, then a software flow-control frame when the clone only returned the first frame.
+    private func queryISO(_ transport: OBDTransport, _ dataHex: String) async -> String? {
+        guard let first = await query(transport, LeafELMFraming.pciPrefixed(dataHex)) else { return nil }
+        guard LeafELMFraming.needsSoftwareFlowControl(first) else { return first }
+        guard let rest = await query(transport, LeafELMFraming.flowControl) else { return first }
+        return first + "\r" + rest
+    }
+
+    private func notePollFailure(_ error: Error) {
+        lastPollFailed = true
+        if hasLiveBattery {
+            statusBanner = "Poll error: \(error.localizedDescription)"
+        } else {
+            statusBanner = "Waiting for car data — \(error.localizedDescription)"
+        }
+    }
+
+    private func appendTrace(_ direction: String, _ text: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        rawLogLines = OBDTrace.appending(rawLogLines, stamp: formatter.string(from: Date()), direction: direction, text: text)
     }
 
     /// VCM speed, gear, and ambient (`0x797`), plus cluster odometer (`0x743`).
@@ -1052,20 +1192,20 @@ public final class GitLeafViewModel: ObservableObject {
         let climate = vcm.climateKw
         var updated = false
 
-        if await query(transport, LeafVehicleQuery.vcmTxHeader) != nil {
-            if let raw = await query(transport, LeafVehicleQuery.gear),
+        if await selectECU(transport, header: "797") {
+            if let raw = await queryISO(transport, LeafVehicleQuery.gear),
                let bytes = try? assembler.assemble(rawELMResponse: raw, expectedRxID: LeafVehicleQuery.vcmRxID),
                let decoded = LeafCANParser.decodeVCMGear(bytes) {
                 gear = decoded
                 updated = true
             }
-            if let raw = await query(transport, LeafVehicleQuery.speed),
+            if let raw = await queryISO(transport, LeafVehicleQuery.speed),
                let bytes = try? assembler.assemble(rawELMResponse: raw, expectedRxID: LeafVehicleQuery.vcmRxID),
                let decoded = LeafCANParser.decodeVCMSpeedKmh(bytes) {
                 speed = decoded
                 updated = true
             }
-            if let raw = await query(transport, LeafVehicleQuery.ambient),
+            if let raw = await queryISO(transport, LeafVehicleQuery.ambient),
                let bytes = try? assembler.assemble(rawELMResponse: raw, expectedRxID: LeafVehicleQuery.vcmRxID),
                let decoded = LeafCANParser.decodeVCMAmbientC(bytes) {
                 ambient = decoded
@@ -1073,8 +1213,8 @@ public final class GitLeafViewModel: ObservableObject {
             }
         }
 
-        if await query(transport, LeafVehicleQuery.meterTxHeader) != nil,
-           let raw = await query(transport, LeafVehicleQuery.odometer),
+        if await selectECU(transport, header: "743"),
+           let raw = await queryISO(transport, LeafVehicleQuery.odometer),
            let bytes = try? assembler.assemble(rawELMResponse: raw, expectedRxID: LeafVehicleQuery.meterRxID),
            let decoded = LeafCANParser.decodeOdometerKm(bytes) {
             odometer = decoded
@@ -1124,8 +1264,8 @@ public final class GitLeafViewModel: ObservableObject {
             )
             let hex = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
             if let transport = activeTransport {
-                _ = try await transport.sendCommand(String(format: "ATSH %03X", txID))
-                _ = try await transport.sendCommand(hex)
+                _ = try await sendLogged(transport, String(format: "ATSH %03X", txID))
+                _ = try await sendLogged(transport, LeafELMFraming.pciPrefixed(hex))
                 await pollOnce()
             } else {
                 if command == .clearDTCs {

@@ -27,6 +27,7 @@ struct AdapterGarageView: View {
                     }
                 }
 
+                if vm.selectedAdapter.transport == .wifiTCP {
                 Section("Wi-Fi OBD2 Endpoint") {
                     HStack {
                         Text("Host IP")
@@ -42,6 +43,7 @@ struct AdapterGarageView: View {
                             .multilineTextAlignment(.trailing)
                             .keyboardType(.numberPad)
                     }
+                }
                 }
 
                 Section("My Nissan Leaf Garage") {

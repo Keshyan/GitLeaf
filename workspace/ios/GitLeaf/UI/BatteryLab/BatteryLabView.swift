@@ -8,6 +8,11 @@ struct BatteryLabView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
+                    if vm.telemetryPhase == .waiting {
+                        Text("Waiting for car data")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
                     // Cell Spread Summary Header
                     HStack(spacing: 12) {
                         MetricCard(title: "CELL DELTA", value: "\(vm.cells.deltaMv) mV", sub: vm.cells.deltaMv > 30 ? "Inspect weak cell" : "Pack well balanced", accent: vm.cells.deltaMv > 30 ? .orange : .green)
@@ -37,7 +42,7 @@ struct BatteryLabView: View {
                             )
                             .foregroundStyle(isWeak ? Color.red : (isBalancing ? Color.yellow : Color.mint))
                         }
-                        .chartYScale(domain: max(3000, vm.cells.minMv - 25)...(vm.cells.maxMv + 15))
+                        .chartYScale(domain: max(3000, vm.cells.minMv - 25)...max(max(3000, vm.cells.minMv - 25) + 20, vm.cells.maxMv + 15))
                         .frame(height: 220)
 
                         HStack(spacing: 14) {
@@ -54,6 +59,7 @@ struct BatteryLabView: View {
                     HStack(spacing: 12) {
                         MetricCard(title: "QUICK CHARGES", value: "\(vm.battery.qcCount)", sub: "CHAdeMO DC Fast", accent: .yellow)
                         MetricCard(title: "L1 / L2 CHARGES", value: "\(vm.battery.l1L2Count)", sub: "AC Home / Public", accent: .green)
+                    }
                     }
 
                     // Historical SOH & Hx Degradation Trend

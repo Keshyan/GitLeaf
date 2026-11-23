@@ -185,4 +185,59 @@ final class GitLeafCoreTests: XCTestCase {
         XCTAssertNil(AdapterPollSchedule.cloneWarning(for: .stnPro))
         XCTAssertNil(AdapterPollSchedule.cloneWarning(for: .elm327v15))
     }
+
+    func testCloneFramingAndReportedDemoNumbersStayOffLiveAdapter() throws {
+        XCTAssertEqual(LeafELMFraming.pciPrefixed("21 01"), "02 21 01")
+        XCTAssertEqual(LeafELMFraming.pciPrefixed("19 02 FF"), "03 19 02 FF")
+        XCTAssertEqual(LeafELMFraming.pciPrefixed("22 11 56"), "03 22 11 56")
+        XCTAssertEqual(LeafELMFraming.flowControl, "30 00 00")
+
+        let firstOnly = "SEARCHING...\r7BB 10 28 61 01 00 00 00 00\rBUFFER FULL\r"
+        XCTAssertTrue(LeafELMFraming.needsSoftwareFlowControl(firstOnly))
+        XCTAssertTrue(ELMResponseRecovery.containsCANFrames(firstOnly))
+        XCTAssertFalse(firstOnly.contains(">"))
+
+        let noisy = "SEARCHING...\rCAN ERROR\r7BB  06  61 0E 90 91 8E 7C 00\rNO DATA\r>"
+        let payload = try? ISOTPAssembler().assemble(rawELMResponse: noisy, expectedRxID: 0x765)
+        let tpms = payload.flatMap { LeafCANParser.decodeTPMS($0) }
+        XCTAssertEqual(try XCTUnwrap(tpms?.rrPsi), 31.0)
+
+        let echoed = "02 21 01\r7BB 04 61 0E 01 02 03 00\r>"
+        let headed = ISOTPAssembler().parseELMLines(echoed, expectedRxID: 0x7BB)
+        XCTAssertEqual(headed.count, 1)
+        XCTAssertEqual(headed.first?.first, 0x04)
+
+        XCTAssertEqual(DemoLeafSnapshot.gids(maxGids: 502), 343)
+        XCTAssertEqual(DemoLeafSnapshot.remainingKwh(gids: 343, whPerGid: 77.5), 26.58)
+        XCTAssertEqual(DemoLeafSnapshot.realSocPct, 76.5)
+        XCTAssertEqual(DemoLeafSnapshot.sohPct, 89.4)
+        XCTAssertEqual(DemoLeafSnapshot.packVoltageV, 368.4)
+        XCTAssertEqual(Int(LeafCANParser.estimateRangeKm(remainingKwh: 26.58).rounded()), 162)
+        var sawNegativePower = false
+        var sawLatency = false
+        for tick in 0..<40 {
+            if DemoLeafSnapshot.powerKw(tick: tick) < 0 { sawNegativePower = true }
+            if DemoLeafSnapshot.latencyMs(tick: tick) == 16 { sawLatency = true }
+        }
+        XCTAssertTrue(sawNegativePower)
+        XCTAssertTrue(sawLatency)
+        XCTAssertEqual(
+            DemoLeafSnapshot.currentAmps(powerKw: -2.10, packVoltageV: DemoLeafSnapshot.packVoltageV),
+            -5.70
+        )
+
+        XCTAssertEqual(
+            LiveDisplayPolicy.phase(realAdapterConnected: true, hasDecodedLiveBattery: false, demoTransportActive: false),
+            .waiting
+        )
+        XCTAssertEqual(
+            LiveDisplayPolicy.phase(realAdapterConnected: true, hasDecodedLiveBattery: true, demoTransportActive: false),
+            .live
+        )
+        XCTAssertEqual(
+            LiveDisplayPolicy.phase(realAdapterConnected: false, hasDecodedLiveBattery: false, demoTransportActive: true),
+            .demo
+        )
+        XCTAssertEqual(OBDTrace.appending(Array(repeating: "x", count: 200), stamp: "00:00:00.000", direction: "TX", text: "21 01").count, 200)
+    }
 }

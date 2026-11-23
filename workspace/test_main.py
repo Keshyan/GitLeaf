@@ -282,3 +282,23 @@ def test_12_prompt_accumulation_preserves_96_cell_reply_and_times_out():
     assert elm_command_status("7BB 21 01", elapsed_s=8.0, timeout_s=OBD_COMMAND_TIMEOUT_S) == "timeout"
     assert elm_command_status("OK\r\n>", elapsed_s=8.0, timeout_s=OBD_COMMAND_TIMEOUT_S) == "complete"
     assert elm_command_status("AT", elapsed_s=1.0, timeout_s=OBD_COMMAND_TIMEOUT_S) == "pending"
+
+
+def test_13_clone_framing_noise_and_software_flow_control():
+    """ATCAF0 requests need a PCI byte, and clone status text must not hide CAN frames."""
+    from protocol_core import elm_pci_request, needs_software_flow_control
+    from protocol_core.isotp import parse_elm_hex_lines
+
+    assert elm_pci_request("21 01") == "02 21 01"
+    assert elm_pci_request("19 02 FF") == "03 19 02 FF"
+    assert elm_pci_request("22 11 56") == "03 22 11 56"
+
+    first_only = "SEARCHING...\r7BB 10 28 61 01 00 00 00 00\rBUFFER FULL\r>"
+    assert needs_software_flow_control(first_only) is True
+
+    noisy = "SEARCHING...\rCAN ERROR\r7BB  06  61 0E 90 91 8E 7C 00\rNO DATA\r>"
+    frames = parse_elm_hex_lines(noisy, expected_rx_id=0x7BB)
+    assert len(frames) == 1
+    assert frames[0].data[0] == 0x06
+    pressures = decode_tpms_pressures(ISOTPAssembler().assemble(frames))
+    assert pressures.rr_psi == 31.0

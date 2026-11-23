@@ -38,7 +38,9 @@ from .obd_adapter import (
     ELM327ProbeSession,
     ELMResponseBuffer,
     elm_command_status,
+    elm_pci_request,
     match_ble_advertisement,
+    needs_software_flow_control,
 )
 from .simulator import VirtualLeafOBDAdapter
 
@@ -77,9 +79,11 @@ __all__ = [
     "decode_vcm_speed_kmh",
     "ELMResponseBuffer",
     "elm_command_status",
+    "elm_pci_request",
     "encode_single_frame",
     "estimate_range_km",
     "match_ble_advertisement",
+    "needs_software_flow_control",
     "OBD_COMMAND_TIMEOUT_S",
     "OBD_CONNECT_TIMEOUT_S",
     "parse_elm_hex_lines",
